@@ -1,5 +1,16 @@
 device: cuda
 
+input:
+  mode: prepared
+  source_path: null
+  prepared_root: prepared_inputs/runtime
+  scene_name: runtime_scene
+  camera_id: "00"
+  image_ext: png
+  target_fps: 5.0
+  recursive_images: false
+  overwrite: true
+
 model:
   checkpoint: checkpoints/50_longstream.pt
   strict_load: false
@@ -56,7 +67,7 @@ data:
   format: generalizable
   data_roots_file: data_roots.txt
   camera: null
-  img_path: /horizon-bucket/saturn_v_4dlabel/004_vision/01_users/chong.cheng/datasets/kitti/dataset
+  img_path: prepared_inputs/runtime
   stride: 1
   max_frames: null
   size: 518
