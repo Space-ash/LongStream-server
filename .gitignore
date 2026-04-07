@@ -1,5 +1,8 @@
 .DS_Store
 
+# Local model
+model/
+
 # Python cache and build artifacts
 __pycache__/
 *.py[cod]
@@ -22,6 +25,8 @@ env/
 
 # Local runtime artifacts
 outputs/
+inputs/
+prepared_inputs/
 skyseg.onnx
 
 # Local checkpoints and weights

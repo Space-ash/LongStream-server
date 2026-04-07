@@ -6,7 +6,6 @@ from longstream.core.cli import (
     parse_runtime_args,
 )
 from longstream.core.infer import run_inference_cfg
-from longstream.preprocess import prepare_input_cfg
 
 
 def main():
@@ -14,7 +13,6 @@ def main():
     add_runtime_arguments(parser)
     args = parse_runtime_args(parser)
     cfg = load_config_with_overrides(args)
-    cfg = prepare_input_cfg(cfg)
     run_inference_cfg(cfg)
 
 

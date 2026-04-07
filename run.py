@@ -7,7 +7,6 @@ from longstream.core.cli import (
 )
 from longstream.core.infer import run_inference_cfg
 from longstream.eval import evaluate_predictions_cfg
-from longstream.preprocess import prepare_input_cfg
 
 
 def main():
@@ -17,7 +16,6 @@ def main():
     args = parse_runtime_args(parser)
 
     cfg = load_config_with_overrides(args)
-    cfg = prepare_input_cfg(cfg)
     print("[longstream] run: inference", flush=True)
     run_inference_cfg(cfg)
     if not args.skip_eval:

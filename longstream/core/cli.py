@@ -19,25 +19,6 @@ def add_runtime_arguments(parser):
         default=default_config_path(),
         help="Path to longstream config yaml.",
     )
-    parser.add_argument("--input-mode", default=None, help="prepared | video | images")
-    parser.add_argument(
-        "--source-path",
-        default=None,
-        help="Raw video path or image path used by input preprocessing.",
-    )
-    parser.add_argument(
-        "--prepared-root",
-        default=None,
-        help="Stable prepared meta_root used after preprocessing.",
-    )
-    parser.add_argument("--input-scene-name", default=None)
-    parser.add_argument("--input-camera-id", default=None)
-    parser.add_argument("--input-image-ext", default=None)
-    parser.add_argument("--extract-fps", type=float, default=None)
-    parser.add_argument("--recursive-images", action="store_true")
-    parser.add_argument("--no-recursive-images", action="store_true")
-    parser.add_argument("--overwrite-prepared", action="store_true")
-    parser.add_argument("--no-overwrite-prepared", action="store_true")
     parser.add_argument(
         "--dataset",
         default=None,
@@ -99,39 +80,7 @@ def parse_runtime_args(parser):
 def load_config_with_overrides(args):
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f) or {}
-    cfg.setdefault("input", {})
     cfg.setdefault("model", {})
-
-    if args.input_mode is not None:
-        cfg["input"]["mode"] = args.input_mode
-
-    if args.source_path is not None:
-        cfg["input"]["source_path"] = args.source_path
-
-    if args.prepared_root is not None:
-        cfg["input"]["prepared_root"] = args.prepared_root
-
-    if args.input_scene_name is not None:
-        cfg["input"]["scene_name"] = args.input_scene_name
-
-    if args.input_camera_id is not None:
-        cfg["input"]["camera_id"] = args.input_camera_id
-
-    if args.input_image_ext is not None:
-        cfg["input"]["image_ext"] = args.input_image_ext
-
-    if args.extract_fps is not None:
-        cfg["input"]["target_fps"] = args.extract_fps
-
-    if args.recursive_images:
-        cfg["input"]["recursive_images"] = True
-    if args.no_recursive_images:
-        cfg["input"]["recursive_images"] = False
-
-    if args.overwrite_prepared:
-        cfg["input"]["overwrite"] = True
-    if args.no_overwrite_prepared:
-        cfg["input"]["overwrite"] = False
 
     if args.device is not None:
         cfg["device"] = args.device

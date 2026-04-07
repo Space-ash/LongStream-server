@@ -19,7 +19,6 @@ from longstream.utils.sky_mask import compute_sky_mask
 from longstream.io.save_points import save_pointcloud
 from longstream.io.save_poses_txt import save_w2c_txt, save_intri_txt, save_rel_pose_txt
 from longstream.io.save_images import save_image_sequence, save_video
-from longstream.preprocess import prepare_input_cfg
 
 
 def _to_uint8_rgb(images):
@@ -438,7 +437,6 @@ def run_inference_cfg(cfg: dict):
 def run_inference(config_path: str):
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
-    cfg = prepare_input_cfg(cfg)
     run_inference_cfg(cfg)
 
 

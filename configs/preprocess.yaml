@@ -1,0 +1,38 @@
+input:
+  mode: video
+  source_path: inputs/campus_10s.mp4
+  recursive_images: false
+
+io:
+  scene_name: campus_10s
+  camera_id: "00"
+  image_ext: png
+  overwrite: true
+  normalized_root: prepared_inputs/preprocess/raw
+  final_root: prepared_inputs/preprocess/final
+
+video:
+  target_fps: 5.0
+
+dynamic_filter:
+  enabled: true
+  model_path: ./model/yolo11n-seg.pt
+  save_preview_video: true
+  preview_fps: 10.0
+  dynamic_class_ids: [0, 1, 2, 3, 5, 7]
+  conf: 0.25
+  iou: 0.5
+  max_corners: 800
+  lk_win_size: [21, 21]
+  farneback_levels: 3
+  farneback_winsize: 21
+  pixel_error_threshold: 8.0
+  dynamic_ratio_threshold: 0.6
+  min_motion_magnitude: 3.0
+  min_mask_area: 80
+  max_mask_points: 2000
+  homography_ransac_threshold: 3.0
+  dilation_kernel_size: 5
+  dilation_iterations: 2
+  fallback_keep_semantic_if_homography_fails: true
+  random_seed: 0
