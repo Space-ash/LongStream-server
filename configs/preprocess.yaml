@@ -12,27 +12,44 @@ io:
   final_root: prepared_inputs/preprocess/final
 
 video:
-  target_fps: 5.0
+  # Trial profile: slightly denser sampling than 5 FPS, but still moderate
+  # enough to avoid a large jump in LongStream runtime and memory pressure.
+  target_fps: 8.0
 
 dynamic_filter:
   enabled: true
   model_path: ./model/yolo11n-seg.pt
+  # Switch from planar homography to epipolar geometry.
+  geometry_model: fundamental
   save_preview_video: true
   preview_fps: 10.0
   dynamic_class_ids: [0, 1, 2, 3, 5, 7]
   conf: 0.25
   iou: 0.5
-  max_corners: 800
+  max_corners: 1000
   lk_win_size: [21, 21]
   farneback_levels: 3
-  farneback_winsize: 21
-  pixel_error_threshold: 8.0
-  dynamic_ratio_threshold: 0.6
+  farneback_winsize: 25
+  farneback_backward_winsize: 25
+  # In fundamental mode, pixel_error_threshold means epipolar point-to-line
+  # distance in pixels rather than homography point-to-point distance.
+  pixel_error_threshold: 1.5
+  dynamic_ratio_threshold: 0.45
   min_motion_magnitude: 3.0
   min_mask_area: 80
   max_mask_points: 2000
   homography_ransac_threshold: 3.0
-  dilation_kernel_size: 5
-  dilation_iterations: 2
-  fallback_keep_semantic_if_homography_fails: true
+  fundamental_ransac_threshold: 1.5
+  dilation_kernel_size: 3
+  dilation_iterations: 1
+  temporal_consistency_enabled: true
+  temporal_window_size: 15
+  temporal_vote_ratio_threshold: 0.6
+  temporal_min_track_length: 3
+  temporal_match_iou_threshold: 0.2
+  temporal_max_center_distance_ratio: 0.75
+  # Keep semantic masks as static when the background geometry model cannot be
+  # estimated for a frame pair. This name is geometry-agnostic so we can keep
+  # iterating on the preprocessing algorithm without touching LongStream code.
+  fallback_keep_semantic_if_geometry_fails: true
   random_seed: 0

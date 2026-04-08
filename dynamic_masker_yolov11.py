@@ -125,6 +125,7 @@ class MotionDecision:
     class_name: str
     confidence: float
     area: int
+    bbox_xyxy: Tuple[float, float, float, float]
     sampled_points: int
     median_error: float
     mean_error: float
@@ -132,10 +133,18 @@ class MotionDecision:
     median_flow_magnitude: float
     is_dynamic: bool
     reason: str
+    raw_is_dynamic: Optional[bool] = None
+    track_id: Optional[int] = None
+    temporal_vote_dynamic_count: int = 0
+    temporal_vote_total_count: int = 0
+    temporal_dynamic_fraction: float = 0.0
+    temporal_window_size: int = 1
+    temporal_refined: bool = False
 
 
 @dataclass
-class HomographyDebug:
+class GeometryDebug:
+    model: str
     valid: bool
     matched_points: int
     inlier_points: int
@@ -144,6 +153,8 @@ class HomographyDebug:
 
 @dataclass
 class FramePairResult:
+    original_image: np.ndarray
+    instances: List[InstanceSegmentation]
     masked_image: np.ndarray
     dynamic_mask: np.ndarray
     semantic_mask: np.ndarray
@@ -151,8 +162,9 @@ class FramePairResult:
     overlay_image: np.ndarray
     comparison_image: np.ndarray
     object_decisions: List[MotionDecision] = field(default_factory=list)
-    homography: Optional[np.ndarray] = None
-    homography_debug: Optional[HomographyDebug] = None
+    geometry_model: str = "homography"
+    geometry_matrix: Optional[np.ndarray] = None
+    geometry_debug: Optional[GeometryDebug] = None
 
 
 class SemanticFlowDynamicMasker:
@@ -160,41 +172,70 @@ class SemanticFlowDynamicMasker:
         self,
         model_path: str = "./model/yolo11n-seg.pt",
         dynamic_class_ids: Sequence[int] = DEFAULT_DYNAMIC_CLASS_IDS,
+        geometry_model: str = "fundamental",
         conf: float = 0.25,
         iou: float = 0.5,
         max_corners: int = 800,
         lk_win_size: Tuple[int, int] = (21, 21),
         farneback_levels: int = 3,
         farneback_winsize: int = 21,
+        farneback_backward_winsize: Optional[int] = None,
         pixel_error_threshold: float = 3.0,
         dynamic_ratio_threshold: float = 0.35,
         min_motion_magnitude: float = 0.75,
         min_mask_area: int = 80,
         max_mask_points: int = 2000,
         homography_ransac_threshold: float = 3.0,
+        fundamental_ransac_threshold: float = 1.5,
         dilation_kernel_size: int = 5,
         dilation_iterations: int = 2,
-        fallback_keep_semantic_if_homography_fails: bool = True,
+        temporal_consistency_enabled: bool = True,
+        temporal_window_size: int = 7,
+        temporal_vote_ratio_threshold: float = 0.6,
+        temporal_min_track_length: int = 3,
+        temporal_match_iou_threshold: float = 0.2,
+        temporal_max_center_distance_ratio: float = 0.75,
+        fallback_keep_semantic_if_geometry_fails: bool = True,
         random_seed: int = 0,
     ):
         self.yolo_model = YOLO(model_path)
         self.dynamic_class_ids = tuple(int(x) for x in dynamic_class_ids)
+        self.geometry_model = str(geometry_model).lower()
+        if self.geometry_model not in {"fundamental", "homography"}:
+            raise ValueError(
+                f"unsupported geometry_model: {self.geometry_model}. "
+                "Expected 'fundamental' or 'homography'."
+            )
         self.conf = float(conf)
         self.iou = float(iou)
         self.max_corners = int(max_corners)
         self.lk_win_size = tuple(int(x) for x in lk_win_size)
         self.farneback_levels = int(farneback_levels)
         self.farneback_winsize = int(farneback_winsize)
+        self.farneback_backward_winsize = int(
+            farneback_backward_winsize
+            if farneback_backward_winsize is not None
+            else farneback_winsize
+        )
         self.pixel_error_threshold = float(pixel_error_threshold)
         self.dynamic_ratio_threshold = float(dynamic_ratio_threshold)
         self.min_motion_magnitude = float(min_motion_magnitude)
         self.min_mask_area = int(min_mask_area)
         self.max_mask_points = int(max_mask_points)
         self.homography_ransac_threshold = float(homography_ransac_threshold)
+        self.fundamental_ransac_threshold = float(fundamental_ransac_threshold)
         self.dilation_kernel_size = int(dilation_kernel_size)
         self.dilation_iterations = int(dilation_iterations)
-        self.fallback_keep_semantic_if_homography_fails = bool(
-            fallback_keep_semantic_if_homography_fails
+        self.temporal_consistency_enabled = bool(temporal_consistency_enabled)
+        self.temporal_window_size = max(1, int(temporal_window_size))
+        self.temporal_vote_ratio_threshold = float(temporal_vote_ratio_threshold)
+        self.temporal_min_track_length = max(1, int(temporal_min_track_length))
+        self.temporal_match_iou_threshold = float(temporal_match_iou_threshold)
+        self.temporal_max_center_distance_ratio = float(
+            temporal_max_center_distance_ratio
+        )
+        self.fallback_keep_semantic_if_geometry_fails = bool(
+            fallback_keep_semantic_if_geometry_fails
         )
         self.rng = np.random.default_rng(random_seed)
         self.class_names = self.yolo_model.names
@@ -206,6 +247,13 @@ class SemanticFlowDynamicMasker:
         dynamic_class_ids = dynamic_cfg.pop(
             "dynamic_class_ids", DEFAULT_DYNAMIC_CLASS_IDS
         )
+        if (
+            "fallback_keep_semantic_if_geometry_fails" not in dynamic_cfg
+            and "fallback_keep_semantic_if_homography_fails" in dynamic_cfg
+        ):
+            dynamic_cfg["fallback_keep_semantic_if_geometry_fails"] = dynamic_cfg.pop(
+                "fallback_keep_semantic_if_homography_fails"
+            )
         dynamic_cfg.pop("enabled", None)
         dynamic_cfg.pop("save_preview_video", None)
         dynamic_cfg.pop("preview_fps", None)
@@ -262,13 +310,13 @@ class SemanticFlowDynamicMasker:
             )
         return segmentations
 
-    def _estimate_homography(
+    def _estimate_background_geometry(
         self,
         prev_gray: np.ndarray,
         curr_gray: np.ndarray,
         prev_semantic_mask: np.ndarray,
         curr_semantic_mask: np.ndarray,
-    ) -> Tuple[Optional[np.ndarray], HomographyDebug]:
+    ) -> Tuple[Optional[np.ndarray], GeometryDebug]:
         prev_bg = cv2.bitwise_not(prev_semantic_mask)
         prev_pts = cv2.goodFeaturesToTrack(
             prev_gray,
@@ -278,8 +326,9 @@ class SemanticFlowDynamicMasker:
             mask=prev_bg,
         )
 
-        if prev_pts is None or len(prev_pts) < 4:
-            return None, HomographyDebug(False, 0, 0, 0.0)
+        min_points = 8 if self.geometry_model == "fundamental" else 4
+        if prev_pts is None or len(prev_pts) < min_points:
+            return None, GeometryDebug(self.geometry_model, False, 0, 0, 0.0)
 
         curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
             prev_gray,
@@ -292,14 +341,16 @@ class SemanticFlowDynamicMasker:
         )
 
         if curr_pts is None or status is None:
-            return None, HomographyDebug(False, 0, 0, 0.0)
+            return None, GeometryDebug(self.geometry_model, False, 0, 0, 0.0)
 
         valid = status.reshape(-1) == 1
         good_prev = prev_pts.reshape(-1, 2)[valid]
         good_curr = curr_pts.reshape(-1, 2)[valid]
 
-        if len(good_prev) < 4:
-            return None, HomographyDebug(False, int(len(good_prev)), 0, 0.0)
+        if len(good_prev) < min_points:
+            return None, GeometryDebug(
+                self.geometry_model, False, int(len(good_prev)), 0, 0.0
+            )
 
         h, w = curr_gray.shape[:2]
         keep = (
@@ -315,38 +366,71 @@ class SemanticFlowDynamicMasker:
 
         good_prev = good_prev[keep]
         good_curr = good_curr[keep]
-        if len(good_prev) < 4:
-            return None, HomographyDebug(False, int(len(good_prev)), 0, 0.0)
+        if len(good_prev) < min_points:
+            return None, GeometryDebug(
+                self.geometry_model, False, int(len(good_prev)), 0, 0.0
+            )
 
-        H, inliers = cv2.findHomography(
-            good_prev,
-            good_curr,
-            cv2.RANSAC,
-            self.homography_ransac_threshold,
-        )
-        if H is None or inliers is None:
-            return None, HomographyDebug(False, int(len(good_prev)), 0, 0.0)
+        if self.geometry_model == "fundamental":
+            matrix, inliers = cv2.findFundamentalMat(
+                good_prev,
+                good_curr,
+                cv2.FM_RANSAC,
+                self.fundamental_ransac_threshold,
+                0.99,
+            )
+            if matrix is not None and matrix.shape != (3, 3):
+                matrix = matrix[:3, :3]
+        else:
+            matrix, inliers = cv2.findHomography(
+                good_prev,
+                good_curr,
+                cv2.RANSAC,
+                self.homography_ransac_threshold,
+            )
+
+        if matrix is None or inliers is None:
+            return None, GeometryDebug(
+                self.geometry_model, False, int(len(good_prev)), 0, 0.0
+            )
 
         inlier_count = int(inliers.ravel().sum())
         matched_points = int(len(good_prev))
         inlier_ratio = float(inlier_count / max(matched_points, 1))
-        return H, HomographyDebug(True, matched_points, inlier_count, inlier_ratio)
+        return matrix, GeometryDebug(
+            self.geometry_model, True, matched_points, inlier_count, inlier_ratio
+        )
 
     def _compute_dense_flow(
-        self, prev_gray: np.ndarray, curr_gray: np.ndarray
+        self, src_gray: np.ndarray, dst_gray: np.ndarray, winsize: int
     ) -> np.ndarray:
         return cv2.calcOpticalFlowFarneback(
-            prev_gray,
-            curr_gray,
+            src_gray,
+            dst_gray,
             None,
             pyr_scale=0.5,
             levels=self.farneback_levels,
-            winsize=self.farneback_winsize,
+            winsize=winsize,
             iterations=3,
             poly_n=5,
             poly_sigma=1.2,
             flags=0,
         )
+
+    def _compute_dense_flows(
+        self, prev_gray: np.ndarray, curr_gray: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        forward_flow = self._compute_dense_flow(
+            prev_gray,
+            curr_gray,
+            self.farneback_winsize,
+        )
+        backward_flow = self._compute_dense_flow(
+            curr_gray,
+            prev_gray,
+            self.farneback_backward_winsize,
+        )
+        return forward_flow, backward_flow
 
     def _sample_mask_points(self, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         y_coords, x_coords = np.where(mask > 0)
@@ -362,8 +446,8 @@ class SemanticFlowDynamicMasker:
         self,
         instance_index: int,
         instance: InstanceSegmentation,
-        flow: np.ndarray,
-        homography: Optional[np.ndarray],
+        backward_flow: np.ndarray,
+        geometry_matrix: Optional[np.ndarray],
     ) -> MotionDecision:
         if instance.area < self.min_mask_area:
             return MotionDecision(
@@ -372,6 +456,7 @@ class SemanticFlowDynamicMasker:
                 class_name=instance.class_name,
                 confidence=instance.confidence,
                 area=instance.area,
+                bbox_xyxy=instance.bbox_xyxy,
                 sampled_points=0,
                 median_error=0.0,
                 mean_error=0.0,
@@ -379,22 +464,25 @@ class SemanticFlowDynamicMasker:
                 median_flow_magnitude=0.0,
                 is_dynamic=False,
                 reason="mask_too_small",
+                raw_is_dynamic=False,
             )
 
-        if homography is None:
+        if geometry_matrix is None:
             return MotionDecision(
                 instance_index=instance_index,
                 class_id=instance.class_id,
                 class_name=instance.class_name,
                 confidence=instance.confidence,
                 area=instance.area,
+                bbox_xyxy=instance.bbox_xyxy,
                 sampled_points=0,
                 median_error=0.0,
                 mean_error=0.0,
                 dynamic_ratio=0.0,
                 median_flow_magnitude=0.0,
-                is_dynamic=not self.fallback_keep_semantic_if_homography_fails,
-                reason="homography_unavailable",
+                is_dynamic=not self.fallback_keep_semantic_if_geometry_fails,
+                reason=f"{self.geometry_model}_unavailable",
+                raw_is_dynamic=not self.fallback_keep_semantic_if_geometry_fails,
             )
 
         y_coords, x_coords = self._sample_mask_points(instance.mask)
@@ -405,6 +493,7 @@ class SemanticFlowDynamicMasker:
                 class_name=instance.class_name,
                 confidence=instance.confidence,
                 area=instance.area,
+                bbox_xyxy=instance.bbox_xyxy,
                 sampled_points=int(len(x_coords)),
                 median_error=0.0,
                 mean_error=0.0,
@@ -412,19 +501,80 @@ class SemanticFlowDynamicMasker:
                 median_flow_magnitude=0.0,
                 is_dynamic=False,
                 reason="not_enough_points",
+                raw_is_dynamic=False,
             )
 
-        actual_flow = flow[y_coords, x_coords]
-        actual_pts = np.stack(
+        current_pts = np.stack(
             [x_coords.astype(np.float32), y_coords.astype(np.float32)], axis=1
-        ) + actual_flow
-        src_pts = np.stack(
-            [x_coords.astype(np.float32), y_coords.astype(np.float32)], axis=1
-        ).reshape(-1, 1, 2)
-        pred_pts = cv2.perspectiveTransform(src_pts, homography).reshape(-1, 2)
+        )
+        backward_disp = backward_flow[y_coords, x_coords]
+        prev_pts = current_pts + backward_disp
+        flow_magnitude = np.linalg.norm(backward_disp, axis=1)
+        h, w = instance.mask.shape[:2]
+        valid = (
+            np.isfinite(prev_pts[:, 0])
+            & np.isfinite(prev_pts[:, 1])
+            & (prev_pts[:, 0] >= 0)
+            & (prev_pts[:, 0] < w)
+            & (prev_pts[:, 1] >= 0)
+            & (prev_pts[:, 1] < h)
+        )
+        if not np.any(valid):
+            return MotionDecision(
+                instance_index=instance_index,
+                class_id=instance.class_id,
+                class_name=instance.class_name,
+                confidence=instance.confidence,
+                area=instance.area,
+                bbox_xyxy=instance.bbox_xyxy,
+                sampled_points=0,
+                median_error=0.0,
+                mean_error=0.0,
+                dynamic_ratio=0.0,
+                median_flow_magnitude=0.0,
+                is_dynamic=False,
+                reason="no_valid_correspondence_points",
+                raw_is_dynamic=False,
+            )
+        current_pts = current_pts[valid]
+        prev_pts = prev_pts[valid]
+        flow_magnitude = flow_magnitude[valid]
 
-        errors = np.linalg.norm(actual_pts - pred_pts, axis=1)
-        flow_magnitude = np.linalg.norm(actual_flow, axis=1)
+        if self.geometry_model == "fundamental":
+            prev_h = cv2.convertPointsToHomogeneous(prev_pts).reshape(-1, 3)
+            lines = (geometry_matrix @ prev_h.T).T
+            denom = np.linalg.norm(lines[:, :2], axis=1)
+            valid = denom > 1e-6
+            if not np.any(valid):
+                return MotionDecision(
+                    instance_index=instance_index,
+                    class_id=instance.class_id,
+                    class_name=instance.class_name,
+                    confidence=instance.confidence,
+                    area=instance.area,
+                    bbox_xyxy=instance.bbox_xyxy,
+                    sampled_points=0,
+                    median_error=0.0,
+                    mean_error=0.0,
+                    dynamic_ratio=0.0,
+                    median_flow_magnitude=0.0,
+                    is_dynamic=False,
+                    reason="degenerate_epipolar_lines",
+                    raw_is_dynamic=False,
+                )
+            lines = lines[valid]
+            current_pts = current_pts[valid]
+            flow_magnitude = flow_magnitude[valid]
+            errors = np.abs(
+                lines[:, 0] * current_pts[:, 0]
+                + lines[:, 1] * current_pts[:, 1]
+                + lines[:, 2]
+            ) / np.linalg.norm(lines[:, :2], axis=1)
+        else:
+            src_pts = prev_pts.reshape(-1, 1, 2)
+            pred_pts = cv2.perspectiveTransform(src_pts, geometry_matrix).reshape(-1, 2)
+            errors = np.linalg.norm(current_pts - pred_pts, axis=1)
+
         median_error = float(np.median(errors))
         mean_error = float(np.mean(errors))
         dynamic_ratio = float(np.mean(errors > self.pixel_error_threshold))
@@ -444,6 +594,7 @@ class SemanticFlowDynamicMasker:
             class_name=instance.class_name,
             confidence=instance.confidence,
             area=instance.area,
+            bbox_xyxy=instance.bbox_xyxy,
             sampled_points=int(len(x_coords)),
             median_error=median_error,
             mean_error=mean_error,
@@ -451,6 +602,7 @@ class SemanticFlowDynamicMasker:
             median_flow_magnitude=median_flow_magnitude,
             is_dynamic=is_dynamic,
             reason=reason,
+            raw_is_dynamic=is_dynamic,
         )
 
     def _dilate_mask(self, mask: np.ndarray) -> np.ndarray:
@@ -460,6 +612,204 @@ class SemanticFlowDynamicMasker:
             (self.dilation_kernel_size, self.dilation_kernel_size), dtype=np.uint8
         )
         return cv2.dilate(mask, kernel, iterations=self.dilation_iterations)
+
+    def _bbox_iou(
+        self,
+        bbox_a: Tuple[float, float, float, float],
+        bbox_b: Tuple[float, float, float, float],
+    ) -> float:
+        ax1, ay1, ax2, ay2 = bbox_a
+        bx1, by1, bx2, by2 = bbox_b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union_area = area_a + area_b - inter_area
+        if union_area <= 0.0:
+            return 0.0
+        return float(inter_area / union_area)
+
+    def _bbox_center_and_diag(
+        self, bbox: Tuple[float, float, float, float]
+    ) -> Tuple[np.ndarray, float]:
+        x1, y1, x2, y2 = bbox
+        center = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+        diag = float(np.hypot(max(0.0, x2 - x1), max(0.0, y2 - y1)))
+        return center, max(diag, 1.0)
+
+    def _render_result_visuals(self, result: FramePairResult) -> None:
+        dynamic_mask = np.zeros(result.original_image.shape[:2], dtype=np.uint8)
+        static_mask = np.zeros(result.original_image.shape[:2], dtype=np.uint8)
+        decision_by_index = {
+            decision.instance_index: decision for decision in result.object_decisions
+        }
+
+        for idx, instance in enumerate(result.instances):
+            decision = decision_by_index.get(idx)
+            if decision is None:
+                continue
+            if decision.is_dynamic:
+                dynamic_mask = np.maximum(dynamic_mask, instance.mask.astype(np.uint8) * 255)
+            else:
+                static_mask = np.maximum(static_mask, instance.mask.astype(np.uint8) * 255)
+
+        dynamic_mask = self._dilate_mask(dynamic_mask)
+        masked_image = result.original_image.copy()
+        masked_image[dynamic_mask > 0] = 0
+        overlay_image = self._build_overlay(result.original_image, dynamic_mask, static_mask)
+        comparison_image = np.hstack([result.original_image, overlay_image, masked_image])
+
+        result.dynamic_mask = dynamic_mask
+        result.static_mask = static_mask
+        result.masked_image = masked_image
+        result.overlay_image = overlay_image
+        result.comparison_image = comparison_image
+
+    def _match_to_previous_track(
+        self,
+        prev_result: FramePairResult,
+        curr_decision: MotionDecision,
+        used_prev_indices: set,
+    ) -> Optional[int]:
+        curr_center, curr_diag = self._bbox_center_and_diag(curr_decision.bbox_xyxy)
+        best_idx = None
+        best_score = None
+
+        for prev_decision in prev_result.object_decisions:
+            prev_idx = prev_decision.instance_index
+            if prev_idx in used_prev_indices:
+                continue
+            if prev_decision.class_id != curr_decision.class_id:
+                continue
+
+            iou = self._bbox_iou(prev_decision.bbox_xyxy, curr_decision.bbox_xyxy)
+            prev_center, prev_diag = self._bbox_center_and_diag(prev_decision.bbox_xyxy)
+            norm_dist = float(
+                np.linalg.norm(curr_center - prev_center) / max(curr_diag, prev_diag, 1.0)
+            )
+            if (
+                iou < self.temporal_match_iou_threshold
+                and norm_dist > self.temporal_max_center_distance_ratio
+            ):
+                continue
+
+            score = iou - 0.1 * norm_dist
+            if best_score is None or score > best_score:
+                best_score = score
+                best_idx = prev_idx
+
+        return best_idx
+
+    def _assign_temporal_tracks(
+        self, results: List[FramePairResult]
+    ) -> Dict[int, List[Tuple[int, int]]]:
+        tracks: Dict[int, List[Tuple[int, int]]] = {}
+        next_track_id = 0
+
+        for frame_idx, result in enumerate(results):
+            if frame_idx == 0:
+                for decision in result.object_decisions:
+                    decision.track_id = next_track_id
+                    tracks[next_track_id] = [(frame_idx, decision.instance_index)]
+                    next_track_id += 1
+                continue
+
+            prev_result = results[frame_idx - 1]
+            used_prev_indices = set()
+            prev_track_ids = {
+                decision.instance_index: decision.track_id
+                for decision in prev_result.object_decisions
+            }
+
+            for decision in result.object_decisions:
+                prev_idx = self._match_to_previous_track(
+                    prev_result,
+                    decision,
+                    used_prev_indices,
+                )
+                if prev_idx is not None:
+                    used_prev_indices.add(prev_idx)
+                    track_id = prev_track_ids.get(prev_idx)
+                    if track_id is not None:
+                        decision.track_id = track_id
+                        tracks.setdefault(track_id, []).append(
+                            (frame_idx, decision.instance_index)
+                        )
+                        continue
+
+                decision.track_id = next_track_id
+                tracks[next_track_id] = [(frame_idx, decision.instance_index)]
+                next_track_id += 1
+
+        return tracks
+
+    def _apply_temporal_consistency(self, results: List[FramePairResult]) -> None:
+        for result in results:
+            for decision in result.object_decisions:
+                if decision.raw_is_dynamic is None:
+                    decision.raw_is_dynamic = decision.is_dynamic
+
+        if (
+            not self.temporal_consistency_enabled
+            or self.temporal_window_size <= 1
+            or not results
+        ):
+            for result in results:
+                self._render_result_visuals(result)
+            return
+
+        tracks = self._assign_temporal_tracks(results)
+        radius = self.temporal_window_size // 2
+        decision_lookup = {
+            (frame_idx, decision.instance_index): decision
+            for frame_idx, result in enumerate(results)
+            for decision in result.object_decisions
+        }
+
+        for track in tracks.values():
+            if not track:
+                continue
+            track = sorted(track, key=lambda item: item[0])
+            for pos, key in enumerate(track):
+                decision = decision_lookup[key]
+                start = max(0, pos - radius)
+                end = min(len(track), pos + radius + 1)
+                window_keys = track[start:end]
+                vote_total = len(window_keys)
+                vote_dynamic = sum(
+                    1
+                    for item in window_keys
+                    if bool(decision_lookup[item].raw_is_dynamic)
+                )
+                dynamic_fraction = float(vote_dynamic / max(vote_total, 1))
+                refined_is_dynamic = bool(decision.raw_is_dynamic)
+                if vote_total >= self.temporal_min_track_length:
+                    refined_is_dynamic = (
+                        dynamic_fraction >= self.temporal_vote_ratio_threshold
+                    )
+                decision.temporal_vote_dynamic_count = vote_dynamic
+                decision.temporal_vote_total_count = vote_total
+                decision.temporal_dynamic_fraction = dynamic_fraction
+                decision.temporal_window_size = self.temporal_window_size
+                decision.temporal_refined = refined_is_dynamic != bool(
+                    decision.raw_is_dynamic
+                )
+                if decision.temporal_refined:
+                    decision.reason = (
+                        f"temporal_vote_refined_to_"
+                        f"{'dynamic' if refined_is_dynamic else 'static'}"
+                    )
+                decision.is_dynamic = refined_is_dynamic
+
+        for result in results:
+            self._render_result_visuals(result)
 
     def _build_overlay(
         self,
@@ -487,43 +837,37 @@ class SemanticFlowDynamicMasker:
         prev_gray = cv2.cvtColor(prev_img, cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY)
 
-        homography, homography_debug = self._estimate_homography(
+        geometry_matrix, geometry_debug = self._estimate_background_geometry(
             prev_gray,
             curr_gray,
             prev_seg.semantic_mask,
             curr_seg.semantic_mask,
         )
-        flow = self._compute_dense_flow(prev_gray, curr_gray)
+        _forward_flow, backward_flow = self._compute_dense_flows(prev_gray, curr_gray)
 
-        dynamic_mask = np.zeros(curr_img.shape[:2], dtype=np.uint8)
-        static_mask = np.zeros(curr_img.shape[:2], dtype=np.uint8)
         object_decisions: List[MotionDecision] = []
 
         for idx, instance in enumerate(curr_seg.instances):
-            decision = self._classify_instance_motion(idx, instance, flow, homography)
+            decision = self._classify_instance_motion(
+                idx, instance, backward_flow, geometry_matrix
+            )
             object_decisions.append(decision)
-            if decision.is_dynamic:
-                dynamic_mask = np.maximum(dynamic_mask, instance.mask.astype(np.uint8) * 255)
-            else:
-                static_mask = np.maximum(static_mask, instance.mask.astype(np.uint8) * 255)
-
-        dynamic_mask = self._dilate_mask(dynamic_mask)
-        masked_image = curr_img.copy()
-        masked_image[dynamic_mask > 0] = 0
-
-        overlay_image = self._build_overlay(curr_img, dynamic_mask, static_mask)
-        comparison_image = np.hstack([curr_img, overlay_image, masked_image])
-        return FramePairResult(
-            masked_image=masked_image,
-            dynamic_mask=dynamic_mask,
+        result = FramePairResult(
+            original_image=curr_img,
+            instances=curr_seg.instances,
+            masked_image=np.zeros_like(curr_img),
+            dynamic_mask=np.zeros(curr_img.shape[:2], dtype=np.uint8),
             semantic_mask=curr_seg.semantic_mask,
-            static_mask=static_mask,
-            overlay_image=overlay_image,
-            comparison_image=comparison_image,
+            static_mask=np.zeros(curr_img.shape[:2], dtype=np.uint8),
+            overlay_image=np.zeros_like(curr_img),
+            comparison_image=np.zeros((curr_img.shape[0], curr_img.shape[1] * 3, 3), dtype=np.uint8),
             object_decisions=object_decisions,
-            homography=homography,
-            homography_debug=homography_debug,
+            geometry_model=self.geometry_model,
+            geometry_matrix=geometry_matrix,
+            geometry_debug=geometry_debug,
         )
+        self._render_result_visuals(result)
+        return result
 
     def _list_image_paths(self, image_dir: Path) -> List[Path]:
         paths = [
@@ -601,10 +945,16 @@ class SemanticFlowDynamicMasker:
         )
 
         prev_image = first_image
+        frame_results: List[Tuple[Path, FramePairResult]] = []
         for image_path in image_paths[1:]:
             curr_image = _read_image(image_path)
             result = self.process_frame_pair(prev_image, curr_image)
+            frame_results.append((image_path, result))
+            prev_image = curr_image
 
+        self._apply_temporal_consistency([result for _, result in frame_results])
+
+        for image_path, result in frame_results:
             _write_image(dst_image_dir / image_path.name, result.masked_image)
             _write_image(
                 debug_root / "dynamic_masks" / image_path.with_suffix(".png").name,
@@ -623,8 +973,13 @@ class SemanticFlowDynamicMasker:
             report = {
                 "frame_name": image_path.name,
                 "is_reference_frame": False,
-                "homography_debug": asdict(result.homography_debug)
-                if result.homography_debug is not None
+                "geometry_model": result.geometry_model,
+                "geometry_debug": asdict(result.geometry_debug)
+                if result.geometry_debug is not None
+                else None,
+                "homography_debug": asdict(result.geometry_debug)
+                if result.geometry_model == "homography"
+                and result.geometry_debug is not None
                 else None,
                 "object_decisions": [asdict(item) for item in result.object_decisions],
             }
@@ -635,7 +990,6 @@ class SemanticFlowDynamicMasker:
             ) as f:
                 json.dump(report, f, indent=2, ensure_ascii=True)
             summary_records.append(report)
-            prev_image = curr_image
 
         if preview_writer is not None:
             preview_writer.release()
@@ -647,6 +1001,10 @@ class SemanticFlowDynamicMasker:
             "camera_id": camera_id,
             "num_frames": len(image_paths),
             "preview_video": str(preview_path) if save_preview_video else None,
+            "geometry_model": self.geometry_model,
+            "temporal_consistency_enabled": self.temporal_consistency_enabled,
+            "temporal_window_size": self.temporal_window_size,
+            "temporal_vote_ratio_threshold": self.temporal_vote_ratio_threshold,
             "dynamic_classes": list(self.dynamic_class_ids),
             "reports": summary_records,
         }
