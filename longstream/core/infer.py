@@ -294,7 +294,7 @@ def run_inference_cfg(cfg: dict):
                         for mask in raw_sky_masks
                     ]
 
-            if save_depth and "depth" in outputs:
+            if save_depth and outputs.get("depth") is not None:
                 print(f"[longstream] sequence {seq.name}: saving depth", flush=True)
                 depth = outputs["depth"][0, :, :, :, 0].detach().cpu().numpy()
                 depth_dir = os.path.join(seq_dir, "depth", "dpt")
@@ -323,7 +323,7 @@ def run_inference_cfg(cfg: dict):
                 print(
                     f"[longstream] sequence {seq.name}: saving point clouds", flush=True
                 )
-                if "world_points" in outputs:
+                if outputs.get("world_points") is not None:
                     if "rel_pose_enc" in outputs:
                         abs_pose_enc = compose_abs_from_rel(
                             outputs["rel_pose_enc"][0], keyframe_indices[0]
@@ -372,7 +372,7 @@ def run_inference_cfg(cfg: dict):
                         seed=0,
                     )
 
-                if "depth" in outputs and (
+                if outputs.get("depth") is not None and (
                     "rel_pose_enc" in outputs or "pose_enc" in outputs
                 ):
                     depth = outputs["depth"][0, :, :, :, 0]

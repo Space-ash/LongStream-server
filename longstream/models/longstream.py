@@ -1,6 +1,8 @@
+import os
 from typing import Tuple, List, Optional, Dict
 import torch
 import torch.nn as nn
+from torch import autocast
 from huggingface_hub import PyTorchModelHubMixin
 
 from longstream.utils.vendor.dust3r.utils.misc import freeze_all_params
@@ -181,6 +183,7 @@ class LongStream(nn.Module, PyTorchModelHubMixin):
         rel_pose_inputs: Optional[Dict] = None,
         is_keyframe: Optional[torch.Tensor] = None,
     ):
+        skip_dense_heads = os.getenv("SKIP_DENSE_HEADS", "0") == "1"
 
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
@@ -197,166 +200,184 @@ class LongStream(nn.Module, PyTorchModelHubMixin):
         if rel_pose_inputs is not None and "keyframe_indices" in rel_pose_inputs:
             keyframe_indices = rel_pose_inputs["keyframe_indices"]
 
-        if aggregator_kv_cache_list is not None:
-            (
-                aggregated_tokens_list,
-                patch_start_idx,
-                aggregator_kv_cache_list,
-                _,
-            ) = self.aggregator(
-                images,
-                mode=mode,
-                kv_cache_list=aggregator_kv_cache_list,
-                is_keyframe=is_keyframe,
-                keyframe_indices=keyframe_indices,
-                additional_tokens=additional_tokens,
-                reorder_keyframes_first=False,
-            )
-        else:
-            aggregated_tokens_list, patch_start_idx, _ = self.aggregator(
-                images,
-                mode=mode,
-                is_keyframe=is_keyframe,
-                keyframe_indices=keyframe_indices,
-                additional_tokens=additional_tokens,
-                reorder_keyframes_first=False,
-            )
-
         predictions = {}
-
-        predicted_scale_factor = None
-        if self.enable_scale_token and additional_tokens is not None:
-
-            if len(aggregated_tokens_list) > 0:
-                last_layer_features = aggregated_tokens_list[-1]
-
-                scale_token_idx = patch_start_idx - 1
-                scale_token_output_features = last_layer_features[
-                    :, :, scale_token_idx, :
-                ]
-
-                scale_token_output_features = scale_token_output_features.mean(dim=1)
-
-                scale_logits = self.scale_head(scale_token_output_features).squeeze(-1)
-
-                predicted_scale_factor = torch.exp(scale_logits)
-
-                predictions["predicted_scale_factor"] = predicted_scale_factor
-                predictions["scale_token_features"] = scale_token_output_features
-
-        if self.enable_camera_head and self.camera_head is not None:
-            if camera_head_kv_cache_list is not None:
-                pose_enc_list, camera_head_kv_cache_list = self.camera_head(
+        with autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=images.device.type == "cuda",
+        ):
+            if aggregator_kv_cache_list is not None:
+                (
                     aggregated_tokens_list,
+                    patch_start_idx,
+                    aggregator_kv_cache_list,
+                    _,
+                ) = self.aggregator(
+                    images,
                     mode=mode,
-                    kv_cache_list=camera_head_kv_cache_list,
+                    kv_cache_list=aggregator_kv_cache_list,
+                    is_keyframe=is_keyframe,
+                    keyframe_indices=keyframe_indices,
+                    additional_tokens=additional_tokens,
+                    reorder_keyframes_first=False,
                 )
             else:
-                pose_enc_list = self.camera_head(aggregated_tokens_list, mode=mode)
+                aggregated_tokens_list, patch_start_idx, _ = self.aggregator(
+                    images,
+                    mode=mode,
+                    is_keyframe=is_keyframe,
+                    keyframe_indices=keyframe_indices,
+                    additional_tokens=additional_tokens,
+                    reorder_keyframes_first=False,
+                )
 
-            final_pose_enc = pose_enc_list[-1]
-            if self.enable_scale_token and predicted_scale_factor is not None:
-                scale = predicted_scale_factor.view(-1, 1, 1)
+            predicted_scale_factor = None
+            if self.enable_scale_token and additional_tokens is not None:
 
-                scaled_t = final_pose_enc[..., :3] * scale
-                scaled_pose_enc = torch.cat([scaled_t, final_pose_enc[..., 3:]], dim=-1)
-                predictions["pose_enc"] = scaled_pose_enc
-            else:
-                predictions["pose_enc"] = final_pose_enc
+                if len(aggregated_tokens_list) > 0:
+                    last_layer_features = aggregated_tokens_list[-1]
 
-            if self.training:
+                    scale_token_idx = patch_start_idx - 1
+                    scale_token_output_features = last_layer_features[
+                        :, :, scale_token_idx, :
+                    ]
 
+                    scale_token_output_features = scale_token_output_features.mean(dim=1)
+
+                    scale_logits = self.scale_head(scale_token_output_features).squeeze(
+                        -1
+                    )
+
+                    predicted_scale_factor = torch.exp(scale_logits)
+
+                    predictions["predicted_scale_factor"] = predicted_scale_factor
+                    predictions["scale_token_features"] = scale_token_output_features
+
+            if self.enable_camera_head and self.camera_head is not None:
+                if camera_head_kv_cache_list is not None:
+                    pose_enc_list, camera_head_kv_cache_list = self.camera_head(
+                        aggregated_tokens_list,
+                        mode=mode,
+                        kv_cache_list=camera_head_kv_cache_list,
+                    )
+                else:
+                    pose_enc_list = self.camera_head(aggregated_tokens_list, mode=mode)
+
+                final_pose_enc = pose_enc_list[-1]
                 if self.enable_scale_token and predicted_scale_factor is not None:
                     scale = predicted_scale_factor.view(-1, 1, 1)
-                    scaled_pose_enc_list = []
-                    for pose_enc in pose_enc_list:
+
+                    scaled_t = final_pose_enc[..., :3] * scale
+                    scaled_pose_enc = torch.cat(
+                        [scaled_t, final_pose_enc[..., 3:]], dim=-1
+                    )
+                    predictions["pose_enc"] = scaled_pose_enc
+                else:
+                    predictions["pose_enc"] = final_pose_enc
+
+                if self.training:
+
+                    if self.enable_scale_token and predicted_scale_factor is not None:
+                        scale = predicted_scale_factor.view(-1, 1, 1)
+                        scaled_pose_enc_list = []
+                        for pose_enc in pose_enc_list:
+
+                            scaled_t = pose_enc[..., :3] * scale
+                            scaled_pose_enc = torch.cat(
+                                [scaled_t, pose_enc[..., 3:]], dim=-1
+                            )
+                            scaled_pose_enc_list.append(scaled_pose_enc)
+                        predictions["pose_enc_list"] = scaled_pose_enc_list
+                    else:
+                        predictions["pose_enc_list"] = pose_enc_list
+
+            if self.rel_pose_head is not None and rel_pose_inputs is not None:
+
+                rel_kwargs = dict(
+                    aggregated_tokens_list=aggregated_tokens_list,
+                    keyframe_indices=rel_pose_inputs.get("keyframe_indices"),
+                    is_keyframe=rel_pose_inputs.get("is_keyframe", is_keyframe),
+                    num_iterations=rel_pose_inputs.get("num_iterations", 4),
+                    mode=mode,
+                    kv_cache_list=rel_pose_inputs.get("kv_cache_list"),
+                )
+
+                rel_kwargs = {k: v for k, v in rel_kwargs.items() if v is not None}
+
+                rel_result = self.rel_pose_head(**rel_kwargs)
+
+                if isinstance(rel_result, dict):
+
+                    pose_enc = rel_result["pose_enc"]
+                    if pose_enc.dtype != torch.float32:
+                        pose_enc = pose_enc.float()
+
+                    if self.enable_scale_token and predicted_scale_factor is not None:
+                        scale = predicted_scale_factor.view(-1, 1, 1)
 
                         scaled_t = pose_enc[..., :3] * scale
-                        scaled_pose_enc = torch.cat(
+                        scaled_rel_pose_enc = torch.cat(
                             [scaled_t, pose_enc[..., 3:]], dim=-1
                         )
-                        scaled_pose_enc_list.append(scaled_pose_enc)
-                    predictions["pose_enc_list"] = scaled_pose_enc_list
-                else:
-                    predictions["pose_enc_list"] = pose_enc_list
+                        predictions["rel_pose_enc"] = scaled_rel_pose_enc
 
-        if self.rel_pose_head is not None and rel_pose_inputs is not None:
+                        if "pose_enc_list" in rel_result:
+                            scaled_pose_enc_list = []
+                            for iter_pose in rel_result["pose_enc_list"]:
+                                scaled_t = iter_pose[..., :3] * scale
+                                scaled_iter_pose = torch.cat(
+                                    [scaled_t, iter_pose[..., 3:]], dim=-1
+                                )
+                                scaled_pose_enc_list.append(scaled_iter_pose)
+                            predictions["rel_pose_enc_list"] = scaled_pose_enc_list
+                    else:
+                        predictions["rel_pose_enc"] = pose_enc
 
-            rel_kwargs = dict(
-                aggregated_tokens_list=aggregated_tokens_list,
-                keyframe_indices=rel_pose_inputs.get("keyframe_indices"),
-                is_keyframe=rel_pose_inputs.get("is_keyframe", is_keyframe),
-                num_iterations=rel_pose_inputs.get("num_iterations", 4),
-                mode=mode,
-                kv_cache_list=rel_pose_inputs.get("kv_cache_list"),
-            )
+                        if "pose_enc_list" in rel_result:
+                            predictions["rel_pose_enc_list"] = rel_result["pose_enc_list"]
 
-            rel_kwargs = {k: v for k, v in rel_kwargs.items() if v is not None}
+                    predictions["is_keyframe"] = rel_result.get("is_keyframe")
+                    predictions["keyframe_indices"] = rel_result.get("keyframe_indices")
 
-            rel_result = self.rel_pose_head(**rel_kwargs)
+                    if "global_scale" in rel_result:
+                        predictions["global_scale"] = rel_result["global_scale"]
 
-            if isinstance(rel_result, dict):
+                if "kv_cache_list" in rel_result:
+                    predictions["rel_pose_kv_cache_list"] = rel_result["kv_cache_list"]
 
-                pose_enc = rel_result["pose_enc"]
-                if pose_enc.dtype != torch.float32:
-                    pose_enc = pose_enc.float()
-
-                if self.enable_scale_token and predicted_scale_factor is not None:
-                    scale = predicted_scale_factor.view(-1, 1, 1)
-
-                    scaled_t = pose_enc[..., :3] * scale
-                    scaled_rel_pose_enc = torch.cat(
-                        [scaled_t, pose_enc[..., 3:]], dim=-1
+            if skip_dense_heads:
+                predictions["world_points"] = None
+                predictions["world_points_conf"] = None
+                predictions["depth"] = None
+                predictions["depth_conf"] = None
+            else:
+                if self.point_head is not None:
+                    pts3d, pts3d_conf = self.point_head(
+                        aggregated_tokens_list,
+                        images=images,
+                        patch_start_idx=patch_start_idx,
                     )
-                    predictions["rel_pose_enc"] = scaled_rel_pose_enc
 
-                    if "pose_enc_list" in rel_result:
-                        scaled_pose_enc_list = []
-                        for iter_pose in rel_result["pose_enc_list"]:
-                            scaled_t = iter_pose[..., :3] * scale
-                            scaled_iter_pose = torch.cat(
-                                [scaled_t, iter_pose[..., 3:]], dim=-1
-                            )
-                            scaled_pose_enc_list.append(scaled_iter_pose)
-                        predictions["rel_pose_enc_list"] = scaled_pose_enc_list
-                else:
-                    predictions["rel_pose_enc"] = pose_enc
+                    if self.enable_scale_token and predicted_scale_factor is not None:
+                        scale = predicted_scale_factor.view(-1, 1, 1, 1, 1)
+                        predictions["world_points"] = pts3d * scale
+                    else:
+                        predictions["world_points"] = pts3d
+                    predictions["world_points_conf"] = pts3d_conf
 
-                    if "pose_enc_list" in rel_result:
-                        predictions["rel_pose_enc_list"] = rel_result["pose_enc_list"]
+                if self.depth_head is not None:
+                    depth, depth_conf = self.depth_head(
+                        aggregated_tokens_list,
+                        images=images,
+                        patch_start_idx=patch_start_idx,
+                    )
 
-                predictions["is_keyframe"] = rel_result.get("is_keyframe")
-                predictions["keyframe_indices"] = rel_result.get("keyframe_indices")
-
-                if "global_scale" in rel_result:
-                    predictions["global_scale"] = rel_result["global_scale"]
-
-            if "kv_cache_list" in rel_result:
-                predictions["rel_pose_kv_cache_list"] = rel_result["kv_cache_list"]
-
-        if self.point_head is not None:
-            pts3d, pts3d_conf = self.point_head(
-                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
-            )
-
-            if self.enable_scale_token and predicted_scale_factor is not None:
-                scale = predicted_scale_factor.view(-1, 1, 1, 1, 1)
-                predictions["world_points"] = pts3d * scale
-            else:
-                predictions["world_points"] = pts3d
-            predictions["world_points_conf"] = pts3d_conf
-
-        if self.depth_head is not None:
-            depth, depth_conf = self.depth_head(
-                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
-            )
-
-            if self.enable_scale_token and predicted_scale_factor is not None:
-                scale = predicted_scale_factor.view(-1, 1, 1, 1, 1)
-                predictions["depth"] = depth * scale
-            else:
-                predictions["depth"] = depth
-            predictions["depth_conf"] = depth_conf
+                    if self.enable_scale_token and predicted_scale_factor is not None:
+                        scale = predicted_scale_factor.view(-1, 1, 1, 1, 1)
+                        predictions["depth"] = depth * scale
+                    else:
+                        predictions["depth"] = depth
+                    predictions["depth_conf"] = depth_conf
 
         if aggregator_kv_cache_list is not None:
             predictions["aggregator_kv_cache_list"] = aggregator_kv_cache_list

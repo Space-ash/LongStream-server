@@ -596,6 +596,17 @@ class STreamAggregator(nn.Module):
                     )
                     output_list.append(concat_inter)
 
+        if len(output_list) >= 24:
+            keep_indices = {4, 11, 17, 23, len(output_list) - 1}
+            for idx, layer_output in enumerate(output_list):
+                if idx in keep_indices:
+                    continue
+                output_list[idx] = torch.empty(
+                    0,
+                    device=layer_output.device,
+                    dtype=layer_output.dtype,
+                )
+
         if kv_cache_list is not None:
             return (
                 output_list,
