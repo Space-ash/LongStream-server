@@ -1,10 +1,10 @@
 input:
-  mode: video
-  source_path: ../zhan/1/2026-03-27-14-15-51.avi
+  mode: images
+  source_path: ../ETH3D/terrains/terrains_dslr_undistorted/images
   recursive_images: false
 
 io:
-  scene_name: zhan_1_1fps
+  scene_name: terrains
   camera_id: "00"
   image_ext: png
   overwrite: true

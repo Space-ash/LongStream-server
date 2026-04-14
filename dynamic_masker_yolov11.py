@@ -76,6 +76,36 @@ def _resize_mask(mask: np.ndarray, image_shape_hw: Tuple[int, int]) -> np.ndarra
     return cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
 
 
+def _resize_image(image: np.ndarray, image_shape_hw: Tuple[int, int]) -> np.ndarray:
+    h, w = image_shape_hw
+    if image.shape[:2] == (h, w):
+        return image
+    return cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _ensure_even_size(width: int, height: int) -> Tuple[int, int]:
+    width = max(2, int(width))
+    height = max(2, int(height))
+    if width % 2 != 0:
+        width -= 1
+    if height % 2 != 0:
+        height -= 1
+    return max(2, width), max(2, height)
+
+
+def _prepare_preview_frame(frame: np.ndarray, max_side: int = 4096) -> np.ndarray:
+    h, w = frame.shape[:2]
+    scale = min(1.0, float(max_side) / float(max(h, w)))
+    target_w = max(1, int(round(w * scale)))
+    target_h = max(1, int(round(h * scale)))
+    target_w, target_h = _ensure_even_size(target_w, target_h)
+    if (target_h, target_w) != (h, w):
+        frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    elif w % 2 != 0 or h % 2 != 0:
+        frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    return frame
+
+
 def _copy_scene_metadata(src_scene_root: Path, dst_scene_root: Path):
     for subdir in ["cameras", "depths", "masks", "vis_depths"]:
         src = src_scene_root / subdir
@@ -1204,6 +1234,9 @@ class SemanticFlowDynamicMasker:
     def process_frame_pair(
         self, prev_img: np.ndarray, curr_img: np.ndarray
     ) -> FramePairResult:
+        # Image datasets may contain mixed resolutions; LK optical flow requires
+        # the two pyramid inputs to have identical sizes.
+        prev_img = _resize_image(prev_img, curr_img.shape[:2])
         prev_seg, curr_seg = self._segment_frames([prev_img, curr_img])
         prev_gray = cv2.cvtColor(prev_img, cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY)
@@ -1319,18 +1352,35 @@ class SemanticFlowDynamicMasker:
         _write_image(dst_image_dir / image_paths[0].name, first_image)
 
         preview_writer = None
+        preview_frame_size: Optional[Tuple[int, int]] = None
         preview_path = debug_root / "dynamic_filter_preview.mp4"
         summary_records = []
 
         def _write_preview(frame: np.ndarray):
-            nonlocal preview_writer
+            nonlocal preview_writer, preview_frame_size
             if not save_preview_video:
                 return
+            frame = _prepare_preview_frame(frame)
             if preview_writer is None:
                 h, w = frame.shape[:2]
+                preview_frame_size = (w, h)
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 preview_writer = cv2.VideoWriter(
                     str(preview_path), fourcc, float(preview_fps), (w, h)
+                )
+                if not preview_writer.isOpened():
+                    raise RuntimeError(
+                        "failed to initialize preview VideoWriter for "
+                        f"{preview_path} with size {(w, h)}"
+                    )
+            elif preview_frame_size is not None and frame.shape[:2] != (
+                preview_frame_size[1],
+                preview_frame_size[0],
+            ):
+                frame = cv2.resize(
+                    frame,
+                    preview_frame_size,
+                    interpolation=cv2.INTER_AREA,
                 )
             preview_writer.write(frame)
 
