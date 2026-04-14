@@ -55,8 +55,9 @@ inference:
 data:
   format: generalizable
   data_roots_file: data_roots.txt
-  camera: null
-  img_path: /path/to/preprocessed_meta_root
+  camera: "00"
+  img_path: prepared_inputs/preprocess/final
+  seq_list: [zhan_1_1fps]
   stride: 1
   max_frames: null
   size: 518
@@ -64,7 +65,7 @@ data:
   patch_size: 14
 
 output:
-  root: outputs
+  root: outputs/zhan_1_1fps
   save_videos: true
   save_points: true
   save_frame_points: true
@@ -73,7 +74,7 @@ output:
   mask_sky: true
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
-  skyseg_path: skyseg.onnx
+  skyseg_path: model/skyseg.onnx
 
 evaluation:
   align_scale: true

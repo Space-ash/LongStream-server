@@ -1,10 +1,10 @@
 input:
   mode: video
-  source_path: inputs/highway_10s.mp4
+  source_path: ../zhan/1/2026-03-27-14-15-51.avi
   recursive_images: false
 
 io:
-  scene_name: highway_10s_10fps
+  scene_name: zhan_1_1fps
   camera_id: "00"
   image_ext: png
   overwrite: true
@@ -12,7 +12,7 @@ io:
   final_root: prepared_inputs/preprocess/final
 
 video:
-  target_fps: 10.0
+  target_fps: 1.0
 
 dynamic_filter:
   enabled: true
