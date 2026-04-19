@@ -137,12 +137,24 @@ def run_inference_cfg(cfg: dict):
     infer_cfg = cfg.get("inference", {})
     output_cfg = cfg.get("output", {})
 
+    # --- optimizations 配置 ---
+    opt_cfg = cfg.get("optimizations", {})
+    filter_cfg = opt_cfg.get("filter", {})
+    corr_cfg = opt_cfg.get("correction", {})
+    correction_enabled = bool(corr_cfg.get("enabled", False))
+    correction_interval = max(1, int(corr_cfg.get("interval", 10)))
+    align_mode = str(corr_cfg.get("align_mode", "full"))
+
     print(f"[longstream] device={device}", flush=True)
     model = LongStreamModel(model_cfg).to(device)
     model.eval()
     print("[longstream] model ready", flush=True)
 
-    loader = LongStreamDataLoader(data_cfg)
+    # 将帧质量过滤配置合并入 data_cfg传给 LongStreamDataLoader
+    data_cfg_with_filter = dict(data_cfg)
+    if filter_cfg:
+        data_cfg_with_filter["filter"] = filter_cfg
+    loader = LongStreamDataLoader(data_cfg_with_filter)
 
     keyframe_stride = int(infer_cfg.get("keyframe_stride", 8))
     keyframe_mode = infer_cfg.get("keyframe_mode", "fixed")
@@ -234,6 +246,8 @@ def run_inference_cfg(cfg: dict):
             frame_ids = list(range(S))
             rgb = _to_uint8_rgb(images[0].permute(0, 2, 3, 1))
 
+            extri_np = None  # 在 if/elif 块外初始化，便于后续校正逻辑判断
+
             if "rel_pose_enc" in outputs:
                 rel_pose_enc = outputs["rel_pose_enc"][0]
                 abs_pose_enc = compose_abs_from_rel(rel_pose_enc, keyframe_indices[0])
@@ -267,6 +281,43 @@ def run_inference_cfg(cfg: dict):
                 )
                 save_intri_txt(os.path.join(pose_dir, "intri.txt"), intri_np, frame_ids)
 
+            # ----------------------------------------------------------------
+            # GT 位姿校正：每 correction_interval 帧对齐一次 GT 位姿并计算尺度补偿系数
+            # scale_corrections[i] 将在保存深度时应用于帧 i 的深度图
+            # ----------------------------------------------------------------
+            scale_corrections = np.ones(S, dtype=np.float32)
+            if correction_enabled and extri_np is not None and seq.gt_poses is not None:
+                gt_poses_arr = seq.gt_poses  # [N, 4, 4]
+                for seg_start in range(0, S, correction_interval):
+                    if seg_start >= len(gt_poses_arr):
+                        break
+                    t_pred_vec = extri_np[seg_start, :3, 3].copy()
+                    t_gt_vec = gt_poses_arr[seg_start, :3, 3]
+                    t_pred_norm = float(np.linalg.norm(t_pred_vec))
+                    t_gt_norm = float(np.linalg.norm(t_gt_vec))
+                    # 首帧原点两者均为 0，跳过防止除零
+                    if t_pred_norm < 1e-6 and t_gt_norm < 1e-6:
+                        seg_scale = 1.0
+                    else:
+                        seg_scale = t_gt_norm / (t_pred_norm + 1e-6)
+                    seg_end = min(seg_start + correction_interval, S)
+                    # 存储本段尺度补偿系数
+                    scale_corrections[seg_start:seg_end] = seg_scale
+                    # 硬重置：将锁帧的预测位姿替换为 GT 位姿
+                    if align_mode == "full" and seg_start < len(gt_poses_arr):
+                        extri_np[seg_start] = gt_poses_arr[seg_start]
+                    print(
+                        f"[longstream][correction] seq={seq.name}"
+                        f" frame={seg_start} scale={seg_scale:.4f}",
+                        flush=True,
+                    )
+                # 将校正后的 extri_np 重新写入位姿文件
+                pose_dir = os.path.join(seq_dir, "poses")
+                _ensure_dir(pose_dir)
+                save_w2c_txt(
+                    os.path.join(pose_dir, "abs_pose_corrected.txt"), extri_np, frame_ids
+                )
+
             if save_images:
                 print(f"[longstream] sequence {seq.name}: saving rgb", flush=True)
                 rgb_dir = os.path.join(seq_dir, "images", "rgb")
@@ -297,6 +348,10 @@ def run_inference_cfg(cfg: dict):
             if save_depth and outputs.get("depth") is not None:
                 print(f"[longstream] sequence {seq.name}: saving depth", flush=True)
                 depth = outputs["depth"][0, :, :, :, 0].detach().cpu().numpy()
+                # 应用尺度补偿系数（来自 GT 位姿校正）
+                if correction_enabled and np.any(scale_corrections != 1.0):
+                    for i in range(S):
+                        depth[i] = depth[i] * float(scale_corrections[i])
                 depth_dir = os.path.join(seq_dir, "depth", "dpt")
                 _ensure_dir(depth_dir)
                 color_dir = os.path.join(seq_dir, "depth", "dpt_plasma")

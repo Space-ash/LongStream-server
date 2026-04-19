@@ -7,8 +7,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
-from sort import Sort
-from ultralytics import YOLO
+
+# YOLO 和跟踪器依赖可选：当 use_yolo=False 时不需要安装这两个库
+try:
+    from sort import Sort
+    from ultralytics import YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
 
 from longstream.preprocess import (
     DepthAnythingV2Runner,
@@ -43,6 +49,15 @@ def _natural_sort_key(path: str):
 
 def _ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _remove_path(path: Path):
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 def _read_image(path: Path) -> np.ndarray:
@@ -268,13 +283,27 @@ class SemanticFlowDynamicMasker:
         non_rigid_flow_variance_threshold: float = 5.0,
         fallback_keep_semantic_if_geometry_fails: bool = True,
         random_seed: int = 0,
+        use_yolo: bool = False,  # 屏蔽 YOLO 动态物体识别，仅保留几何一致性判断
     ):
-        self.yolo_model = YOLO(model_path)
-        self.tracker = Sort(
-            max_age=int(sort_max_age),
-            min_hits=int(sort_min_hits),
-            iou_threshold=float(sort_iou_threshold),
-        )
+        # --- YOLO 及追踪器（可选） ---
+        self.use_yolo = bool(use_yolo)
+        if self.use_yolo:
+            if not _YOLO_AVAILABLE:
+                raise ImportError(
+                    "use_yolo=True 但未安装 ultralytics/sort，"
+                    "请安装依赖或设置 use_yolo=False"
+                )
+            self.yolo_model = YOLO(model_path)
+            self.tracker = Sort(
+                max_age=int(sort_max_age),
+                min_hits=int(sort_min_hits),
+                iou_threshold=float(sort_iou_threshold),
+            )
+            self.class_names = self.yolo_model.names
+        else:
+            self.yolo_model = None
+            self.tracker = None
+            self.class_names = {}
         self.depth_runner = DepthAnythingV2Runner(
             repo_path=depth_repo_path,
             checkpoint_path=depth_checkpoint_path,
@@ -328,7 +357,8 @@ class SemanticFlowDynamicMasker:
             fallback_keep_semantic_if_geometry_fails
         )
         self.rng = np.random.default_rng(random_seed)
-        self.class_names = self.yolo_model.names
+        if self.use_yolo:
+            self.class_names = self.yolo_model.names
 
     @classmethod
     def from_preprocess_config(cls, preprocess_cfg: Dict):
@@ -367,6 +397,16 @@ class SemanticFlowDynamicMasker:
         )
 
     def _segment_frames(self, frames: Sequence[np.ndarray]) -> List[FrameSegmentation]:
+        """YOLO 实例分割。use_yolo=False 时返回空分割结果（仅几何一致性校验仍正常运行）。"""
+        if not self.use_yolo:
+            return [
+                FrameSegmentation(
+                    instances=[],
+                    semantic_mask=np.zeros(f.shape[:2], dtype=np.uint8),
+                )
+                for f in frames
+            ]
+
         results = self.yolo_model(
             list(frames),
             classes=list(self.dynamic_class_ids),
@@ -414,6 +454,8 @@ class SemanticFlowDynamicMasker:
         return segmentations
 
     def _reset_tracker(self) -> None:
+        if not self.use_yolo or self.tracker is None:
+            return
         self.tracker = Sort(
             max_age=self.sort_max_age,
             min_hits=self.sort_min_hits,
@@ -988,6 +1030,10 @@ class SemanticFlowDynamicMasker:
     def _update_tracker_with_instances(
         self, instances: Sequence[InstanceSegmentation]
     ) -> Dict[int, int]:
+        """use_yolo=False 时跳过这一步直接返回空字典。"""
+        if not self.use_yolo or self.tracker is None:
+            return {}
+
         if not instances:
             self.tracker.update(np.empty((0, 5), dtype=np.float32))
             return {}
@@ -1324,9 +1370,19 @@ class SemanticFlowDynamicMasker:
         if not src_image_dir.is_dir():
             raise FileNotFoundError(src_image_dir)
 
-        dst_scene_root = masked_root_path / scene_name
+        final_scene_root = masked_root_path / scene_name
+        in_place_output = prepared_root_path == masked_root_path
+        dst_scene_root = (
+            masked_root_path / f".{scene_name}__dynamic_mask_tmp"
+            if in_place_output
+            else final_scene_root
+        )
+        _remove_path(dst_scene_root)
+        if not in_place_output:
+            _remove_path(final_scene_root)
         dst_image_dir = dst_scene_root / "images" / camera_id
         debug_root = dst_scene_root / "dynamic_filter_debug" / camera_id
+        final_debug_root = final_scene_root / "dynamic_filter_debug" / camera_id
         for path in [
             dst_image_dir,
             debug_root / "dynamic_masks",
@@ -1354,6 +1410,7 @@ class SemanticFlowDynamicMasker:
         preview_writer = None
         preview_frame_size: Optional[Tuple[int, int]] = None
         preview_path = debug_root / "dynamic_filter_preview.mp4"
+        final_preview_path = final_debug_root / "dynamic_filter_preview.mp4"
         summary_records = []
 
         def _write_preview(frame: np.ndarray):
@@ -1449,13 +1506,17 @@ class SemanticFlowDynamicMasker:
         if preview_writer is not None:
             preview_writer.release()
 
+        if in_place_output:
+            _remove_path(final_scene_root)
+            dst_scene_root.replace(final_scene_root)
+
         summary = {
             "prepared_root": str(prepared_root_path),
             "masked_root": str(masked_root_path),
             "scene_name": scene_name,
             "camera_id": camera_id,
             "num_frames": len(image_paths),
-            "preview_video": str(preview_path) if save_preview_video else None,
+            "preview_video": str(final_preview_path) if save_preview_video else None,
             "geometry_model": self.geometry_model,
             "temporal_consistency_enabled": self.temporal_consistency_enabled,
             "temporal_window_size": self.temporal_window_size,
@@ -1466,8 +1527,11 @@ class SemanticFlowDynamicMasker:
             "dynamic_classes": list(self.dynamic_class_ids),
             "reports": summary_records,
         }
+        summary_path = (
+            final_debug_root / "summary.json" if in_place_output else debug_root / "summary.json"
+        )
         with open(
-            debug_root / "summary.json",
+            summary_path,
             "w",
             encoding="utf-8",
         ) as f:

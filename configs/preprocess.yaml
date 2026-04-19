@@ -1,6 +1,10 @@
+# input:
+#   mode: images
+#   source_path: ../ETH3D/terrains/terrains_dslr_undistorted/images
+#   recursive_images: false
 input:
-  mode: images
-  source_path: ../ETH3D/terrains/terrains_dslr_undistorted/images
+  mode: video
+  source_path: ../zhan/1/2026-03-27-14-15-51.avi
   recursive_images: false
 
 io:
