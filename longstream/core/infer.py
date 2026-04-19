@@ -155,11 +155,14 @@ def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode
     段级校正：在每个锚帧计算完整校正变换 C = GT @ inv(pred)，
     并将其传播到段内所有帧，系统性修正长期拼接漂移。
 
+    段尺度因子由段内 pred/GT 帧间相对平移范数的中位数比值决定（而非
+    单个锚帧的绝对平移），这样对世界原点不敏感且对离群帧更稳健。
+
     align_mode="full":
         对段内每帧传播完整校正 corrected[i] = C_anchor @ pred[i]，
         同时修正旋转和平移漂移。
     align_mode="scale_only":
-        仅将锚帧处的尺度比例传播到段内每帧的平移分量。
+        仅将段尺度比例传播到段内每帧的平移分量。
 
     Returns:
         (scale_corrections, corrected_extri_np)
@@ -168,10 +171,12 @@ def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode
     corrected = extri_np.copy()
     scale_corrections = np.ones(S, dtype=np.float32)
 
+    n_gt = len(gt_poses_arr)
+
     # 收集有 GT 对应的锚帧
     anchors = []
     for seg_start in range(0, S, interval):
-        if seg_start >= len(gt_poses_arr):
+        if seg_start >= n_gt:
             break
         anchors.append(seg_start)
 
@@ -181,13 +186,8 @@ def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode
     for seg_idx, a in enumerate(anchors):
         seg_end = anchors[seg_idx + 1] if seg_idx + 1 < len(anchors) else S
 
-        # 锚帧处的尺度比（用于深度 / 点云缩放）
-        t_pred_norm = float(np.linalg.norm(extri_np[a, :3, 3]))
-        t_gt_norm = float(np.linalg.norm(gt_poses_arr[a, :3, 3]))
-        if t_pred_norm > 1e-6 or t_gt_norm > 1e-6:
-            seg_scale = t_gt_norm / (t_pred_norm + 1e-8)
-        else:
-            seg_scale = 1.0
+        # ---- 段尺度：用段内帧间相对运动中位数比值 ----
+        seg_scale = _estimate_segment_scale(extri_np, gt_poses_arr, a, seg_end)
 
         if align_mode == "full":
             # 完整校正变换: C @ pred[a] ≈ gt[a]
@@ -202,6 +202,38 @@ def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode
         scale_corrections[a:seg_end] = seg_scale
 
     return scale_corrections, corrected
+
+
+def _estimate_segment_scale(extri_np, gt_poses_arr, seg_start, seg_end):
+    """
+    估算段 [seg_start, seg_end) 的 GT/pred 尺度比。
+
+    方法：收集段内所有连续帧对 (i, i+1)（要求 GT 可用），计算帧间平移
+    范数比 ||Δt_gt|| / ||Δt_pred||，取中位数作为段尺度。
+
+    当帧间运动不足时退回到锚帧绝对平移范数比。
+    """
+    n_gt = len(gt_poses_arr)
+    ratios = []
+    upper = min(seg_end, n_gt)
+    for i in range(seg_start, upper - 1):
+        j = i + 1
+        if j >= n_gt:
+            break
+        dt_pred = np.linalg.norm(extri_np[j, :3, 3] - extri_np[i, :3, 3])
+        dt_gt = np.linalg.norm(gt_poses_arr[j, :3, 3] - gt_poses_arr[i, :3, 3])
+        if dt_pred > 1e-6:
+            ratios.append(dt_gt / dt_pred)
+
+    if ratios:
+        return float(np.median(ratios))
+
+    # 退回锚帧绝对平移范数比
+    t_pred_norm = float(np.linalg.norm(extri_np[seg_start, :3, 3]))
+    t_gt_norm = float(np.linalg.norm(gt_poses_arr[seg_start, :3, 3]))
+    if t_pred_norm > 1e-6 or t_gt_norm > 1e-6:
+        return t_gt_norm / (t_pred_norm + 1e-8)
+    return 1.0
 
 
 def _apply_depth_corrections(depth_np, scale_corrections):

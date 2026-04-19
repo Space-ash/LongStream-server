@@ -152,6 +152,10 @@ def resolve_gt_poses(
         if extri_dict:
             sorted_names = sorted(extri_dict.keys())
             poses = np.stack([extri_dict[n] for n in sorted_names], axis=0)
+            # camera_yml 存储的是原始世界坐标系 w2c，必须锚定到第 0 帧，
+            # 使其与 gt_poses.npy（已锚定）语义一致，否则下游尺度校正
+            # 依赖的平移范数将绑定在任意世界原点上。
+            poses = anchor_w2c_sequence(poses)
             return poses.astype(np.float32, copy=False), "camera_yml"
         if gt_source == "camera_yml":
             return None, "none"

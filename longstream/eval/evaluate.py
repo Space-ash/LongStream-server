@@ -189,7 +189,7 @@ def _depth_to_world_points(depth, intri, extri, valid_mask):
     return pts_world.astype(np.float32, copy=False)
 
 
-def _load_gt_pointcloud(seq_info, seq_dir, gt_extri, gt_intri, eval_cfg):
+def _load_gt_pointcloud(seq_info, seq_dir, gt_extri, gt_intri, eval_cfg, frame_mapping=None):
     if not gt_extri or not gt_intri:
         return None
 
@@ -197,17 +197,26 @@ def _load_gt_pointcloud(seq_info, seq_dir, gt_extri, gt_intri, eval_cfg):
     if gt_dir is None:
         return None
 
+    all_image_paths = seq_info.image_paths
+    all_stems = frame_stems(all_image_paths)
+
+    # 筛帧后只用同一子集重建 GT 点云，避免把“没推理过的 GT 区域”算进 Chamfer/F1
+    if frame_mapping is not None:
+        eval_indices = [i for i in frame_mapping if 0 <= i < len(all_image_paths)]
+    else:
+        eval_indices = list(range(len(all_image_paths)))
+
     eval_max_points = int(eval_cfg.get("point_eval_max_points", 100000))
     oversample_factor = int(eval_cfg.get("point_eval_oversample_factor", 4))
     per_frame_budget = max(
-        (eval_max_points * oversample_factor) // max(len(seq_info.image_paths), 1), 1
+        (eval_max_points * oversample_factor) // max(len(eval_indices), 1), 1
     )
     rng = np.random.default_rng(0)
     chunks = []
 
-    for image_path, stem in zip(
-        seq_info.image_paths, frame_stems(seq_info.image_paths)
-    ):
+    for orig_idx in eval_indices:
+        image_path = all_image_paths[orig_idx]
+        stem = all_stems[orig_idx]
         depth_path = _resolve_gt_depth_path(seq_info, gt_dir, image_path, stem)
         if depth_path is None or stem not in gt_extri or stem not in gt_intri:
             continue
@@ -492,7 +501,7 @@ def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=None):
         result["has_gt_depth"] = True
         result["video_dpt"] = video_dpt_metrics
 
-    gt_cloud = _load_gt_pointcloud(seq_info, seq_dir, gt_extri, gt_intri, eval_cfg)
+    gt_cloud = _load_gt_pointcloud(seq_info, seq_dir, gt_extri, gt_intri, eval_cfg, frame_mapping)
     pointcloud_metrics = _evaluate_pointclouds(
         seq_info, seq_dir, eval_cfg, pose_align, gt_cloud
     )
