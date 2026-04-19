@@ -60,8 +60,8 @@ inference:
 data:
   format: generalizable
   data_roots_file: data_roots.txt
-  img_path: prepared_inputs/preprocess/final
-  seq_list: [zhan_1_1fps]
+  img_path: prepared_inputs/vkitti2
+  seq_list: [Scene01/clone]
   camera: "00"
   stride: 1
   max_frames: null
@@ -84,7 +84,7 @@ optimizations:
     use_corrected_pose_for_eval: true
 
 output:
-  root: outputs/optimized
+  root: outputs/vkitti2_scene01_clone/optimized
   save_videos: true
   save_images: true
   save_depth: true

@@ -317,12 +317,14 @@ class LongStreamDataLoader:
         return self._resolve_seq_list_relpose()
 
     def _resolve_scene_root(self, seq_entry: str) -> Tuple[str, str]:
-        if os.path.isabs(seq_entry) or os.path.sep in seq_entry:
+        if os.path.isabs(seq_entry):
             scene_root = seq_entry
             name = os.path.basename(os.path.normpath(seq_entry))
         else:
+            # Always join with img_path for relative paths, even if they
+            # contain path separators (e.g. "Scene01/clone").
             scene_root = os.path.join(self.img_path, seq_entry)
-            name = seq_entry
+            name = seq_entry.replace(os.path.sep, "_")
         return name, scene_root
 
     def _resolve_image_dir_generalizable(self, scene_root: str) -> Optional[str]:
