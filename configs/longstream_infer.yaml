@@ -58,6 +58,13 @@ data:
   camera: "00"
   img_path: prepared_inputs/preprocess/final
   seq_list: [zhan_1_1fps]
+  stride: 1
+  max_frames: null
+  size: 518
+  crop: false
+  patch_size: 14
+  gt_source: auto             # camera_yml | npy | auto（优先 cameras/extri.yml，退回 gt_poses.npy）
+  gt_poses_file: gt_poses.npy # 相对于 scene_root 的 npy 缓存路径
 
 optimizations:
   # 优化1：输入预筛选
@@ -65,16 +72,13 @@ optimizations:
     enabled: true
     blur_threshold: 100.0   # 拉普拉斯方差阈值，低于此值视为模糊帧
     motion_threshold: 0.02  # 帧间均值绝对差阈值（0-1归一化），低于此值视为冗余帧
+    save_frame_index_map: true  # 推理时保存 frame_index_map.json
   # 优化2：GT位姿校正
   correction:
     enabled: true
     interval: 10            # 每10帧进行一次尺度/位姿校正
     align_mode: "full"      # full (位姿+尺度) 或 scale_only
-  stride: 1
-  max_frames: null
-  size: 518
-  crop: false
-  patch_size: 14
+    use_corrected_pose_for_eval: true  # 评估时优先使用校正后位姿
 
 output:
   root: outputs/zhan_1_1fps

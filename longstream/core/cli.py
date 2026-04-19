@@ -69,6 +69,23 @@ def add_runtime_arguments(parser):
     parser.add_argument("--no-align-scale", action="store_true")
     parser.add_argument("--mask-sky", action="store_true")
     parser.add_argument("--no-mask-sky", action="store_true")
+
+    # --- 筛帧 / 校正 CLI 覆盖项 ---
+    parser.add_argument("--enable-filter", action="store_true", help="启用帧质量过滤")
+    parser.add_argument("--disable-filter", action="store_true", help="禁用帧质量过滤")
+    parser.add_argument("--filter-blur-threshold", type=float, default=None)
+    parser.add_argument("--filter-motion-threshold", type=float, default=None)
+    parser.add_argument("--enable-correction", action="store_true", help="启用 GT 位姿校正")
+    parser.add_argument("--disable-correction", action="store_true", help="禁用 GT 位姿校正")
+    parser.add_argument("--correction-interval", type=int, default=None)
+    parser.add_argument(
+        "--align-mode", default=None, choices=["full", "scale_only"],
+        help="校正对齐模式：full (位姿+尺度) 或 scale_only"
+    )
+    parser.add_argument(
+        "--gt-source", default=None, choices=["camera_yml", "npy", "auto"],
+        help="GT 位姿来源：camera_yml | npy | auto"
+    )
     return parser
 
 
@@ -205,6 +222,31 @@ def load_config_with_overrides(args):
     if args.no_mask_sky:
         cfg.setdefault("output", {})
         cfg["output"]["mask_sky"] = False
+
+    # --- 筛帧 / 校正 CLI 覆盖 ---
+    opt = cfg.setdefault("optimizations", {})
+
+    if args.enable_filter:
+        opt.setdefault("filter", {})["enabled"] = True
+    if args.disable_filter:
+        opt.setdefault("filter", {})["enabled"] = False
+    if args.filter_blur_threshold is not None:
+        opt.setdefault("filter", {})["blur_threshold"] = args.filter_blur_threshold
+    if args.filter_motion_threshold is not None:
+        opt.setdefault("filter", {})["motion_threshold"] = args.filter_motion_threshold
+
+    if args.enable_correction:
+        opt.setdefault("correction", {})["enabled"] = True
+    if args.disable_correction:
+        opt.setdefault("correction", {})["enabled"] = False
+    if args.correction_interval is not None:
+        opt.setdefault("correction", {})["interval"] = args.correction_interval
+    if args.align_mode is not None:
+        opt.setdefault("correction", {})["align_mode"] = args.align_mode
+
+    if args.gt_source is not None:
+        cfg.setdefault("data", {})
+        cfg["data"]["gt_source"] = args.gt_source
 
     infer_cfg = cfg.setdefault("inference", {})
     if "refresh" not in infer_cfg and "keyframes_per_batch" in infer_cfg:

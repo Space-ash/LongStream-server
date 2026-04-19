@@ -19,6 +19,7 @@ from longstream.utils.sky_mask import compute_sky_mask
 from longstream.io.save_points import save_pointcloud
 from longstream.io.save_poses_txt import save_w2c_txt, save_intri_txt, save_rel_pose_txt
 from longstream.io.save_images import save_image_sequence, save_video
+from longstream.io.frame_index_map import save_frame_index_map
 
 
 def _to_uint8_rgb(images):
@@ -127,6 +128,88 @@ def _save_full_pointcloud(path, point_chunks, color_chunks, max_points=None, see
             colors = colors[keep]
     np.save(os.path.splitext(path)[0] + ".npy", points.astype(np.float32, copy=False))
     save_pointcloud(path, points, colors=colors, max_points=None, seed=seed)
+
+
+def _decode_predicted_extri_intri(outputs, keyframe_indices, H, W):
+    """统一解码预测位姿，返回 (extri_np, intri_np, rel_pose_enc_or_None)。"""
+    rel_pose_enc = None
+    if "rel_pose_enc" in outputs:
+        rel_pose_enc = outputs["rel_pose_enc"][0]
+        abs_pose_enc = compose_abs_from_rel(rel_pose_enc, keyframe_indices[0])
+        extri, intri = pose_encoding_to_extri_intri(
+            abs_pose_enc[None], image_size_hw=(H, W)
+        )
+    elif "pose_enc" in outputs:
+        extri, intri = pose_encoding_to_extri_intri(
+            outputs["pose_enc"][0][None], image_size_hw=(H, W)
+        )
+    else:
+        return None, None, None
+    extri_np = extri[0].detach().cpu().numpy()
+    intri_np = intri[0].detach().cpu().numpy()
+    return extri_np, intri_np, rel_pose_enc
+
+
+def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode):
+    """
+    段级校正：在每个锚帧计算完整校正变换 C = GT @ inv(pred)，
+    并将其传播到段内所有帧，系统性修正长期拼接漂移。
+
+    align_mode="full":
+        对段内每帧传播完整校正 corrected[i] = C_anchor @ pred[i]，
+        同时修正旋转和平移漂移。
+    align_mode="scale_only":
+        仅将锚帧处的尺度比例传播到段内每帧的平移分量。
+
+    Returns:
+        (scale_corrections, corrected_extri_np)
+        scale_corrections: 逐帧尺度因子，用于深度和点云。
+    """
+    corrected = extri_np.copy()
+    scale_corrections = np.ones(S, dtype=np.float32)
+
+    # 收集有 GT 对应的锚帧
+    anchors = []
+    for seg_start in range(0, S, interval):
+        if seg_start >= len(gt_poses_arr):
+            break
+        anchors.append(seg_start)
+
+    if not anchors:
+        return scale_corrections, corrected
+
+    for seg_idx, a in enumerate(anchors):
+        seg_end = anchors[seg_idx + 1] if seg_idx + 1 < len(anchors) else S
+
+        # 锚帧处的尺度比（用于深度 / 点云缩放）
+        t_pred_norm = float(np.linalg.norm(extri_np[a, :3, 3]))
+        t_gt_norm = float(np.linalg.norm(gt_poses_arr[a, :3, 3]))
+        if t_pred_norm > 1e-6 or t_gt_norm > 1e-6:
+            seg_scale = t_gt_norm / (t_pred_norm + 1e-8)
+        else:
+            seg_scale = 1.0
+
+        if align_mode == "full":
+            # 完整校正变换: C @ pred[a] ≈ gt[a]
+            C_a = gt_poses_arr[a] @ np.linalg.inv(extri_np[a])
+            for i in range(a, seg_end):
+                corrected[i] = C_a @ extri_np[i]
+        else:
+            # 仅缩放平移分量
+            for i in range(a, seg_end):
+                corrected[i, :3, 3] = extri_np[i, :3, 3] * seg_scale
+
+        scale_corrections[a:seg_end] = seg_scale
+
+    return scale_corrections, corrected
+
+
+def _apply_depth_corrections(depth_np, scale_corrections):
+    """逐帧应用尺度校正到深度图（就地修改并返回）。"""
+    S = depth_np.shape[0]
+    for i in range(S):
+        depth_np[i] = depth_np[i] * float(scale_corrections[i])
+    return depth_np
 
 
 def run_inference_cfg(cfg: dict):
@@ -247,75 +330,60 @@ def run_inference_cfg(cfg: dict):
             rgb = _to_uint8_rgb(images[0].permute(0, 2, 3, 1))
 
             extri_np = None  # 在 if/elif 块外初始化，便于后续校正逻辑判断
+            intri_np = None
 
-            if "rel_pose_enc" in outputs:
-                rel_pose_enc = outputs["rel_pose_enc"][0]
-                abs_pose_enc = compose_abs_from_rel(rel_pose_enc, keyframe_indices[0])
-                extri, intri = pose_encoding_to_extri_intri(
-                    abs_pose_enc[None], image_size_hw=(H, W)
-                )
-                extri_np = extri[0].detach().cpu().numpy()
-                intri_np = intri[0].detach().cpu().numpy()
+            # ============================================================
+            # 统一解码预测位姿（只做一次）
+            # ============================================================
+            extri_np, intri_np, rel_pose_enc = _decode_predicted_extri_intri(
+                outputs, keyframe_indices, H, W
+            )
 
+            if extri_np is not None:
                 pose_dir = os.path.join(seq_dir, "poses")
                 _ensure_dir(pose_dir)
                 save_w2c_txt(
                     os.path.join(pose_dir, "abs_pose.txt"), extri_np, frame_ids
                 )
                 save_intri_txt(os.path.join(pose_dir, "intri.txt"), intri_np, frame_ids)
-                save_rel_pose_txt(
-                    os.path.join(pose_dir, "rel_pose.txt"), rel_pose_enc, frame_ids
-                )
-            elif "pose_enc" in outputs:
-                pose_enc = outputs["pose_enc"][0]
-                extri, intri = pose_encoding_to_extri_intri(
-                    pose_enc[None], image_size_hw=(H, W)
-                )
-                extri_np = extri[0].detach().cpu().numpy()
-                intri_np = intri[0].detach().cpu().numpy()
+                if rel_pose_enc is not None:
+                    save_rel_pose_txt(
+                        os.path.join(pose_dir, "rel_pose.txt"), rel_pose_enc, frame_ids
+                    )
 
-                pose_dir = os.path.join(seq_dir, "poses")
-                _ensure_dir(pose_dir)
-                save_w2c_txt(
-                    os.path.join(pose_dir, "abs_pose.txt"), extri_np, frame_ids
-                )
-                save_intri_txt(os.path.join(pose_dir, "intri.txt"), intri_np, frame_ids)
-
-            # ----------------------------------------------------------------
-            # GT 位姿校正：每 correction_interval 帧对齐一次 GT 位姿并计算尺度补偿系数
-            # scale_corrections[i] 将在保存深度时应用于帧 i 的深度图
-            # ----------------------------------------------------------------
+            # ============================================================
+            # GT 位姿校正：段级尺度 + 锚帧硬重置
+            # scale_corrections 同时用于深度和点云
+            # ============================================================
             scale_corrections = np.ones(S, dtype=np.float32)
             if correction_enabled and extri_np is not None and seq.gt_poses is not None:
-                gt_poses_arr = seq.gt_poses  # [N, 4, 4]
+                scale_corrections, extri_np = _compute_segment_corrections(
+                    extri_np, seq.gt_poses, S, correction_interval, align_mode
+                )
                 for seg_start in range(0, S, correction_interval):
-                    if seg_start >= len(gt_poses_arr):
+                    if seg_start >= len(seq.gt_poses):
                         break
-                    t_pred_vec = extri_np[seg_start, :3, 3].copy()
-                    t_gt_vec = gt_poses_arr[seg_start, :3, 3]
-                    t_pred_norm = float(np.linalg.norm(t_pred_vec))
-                    t_gt_norm = float(np.linalg.norm(t_gt_vec))
-                    # 首帧原点两者均为 0，跳过防止除零
-                    if t_pred_norm < 1e-6 and t_gt_norm < 1e-6:
-                        seg_scale = 1.0
-                    else:
-                        seg_scale = t_gt_norm / (t_pred_norm + 1e-6)
-                    seg_end = min(seg_start + correction_interval, S)
-                    # 存储本段尺度补偿系数
-                    scale_corrections[seg_start:seg_end] = seg_scale
-                    # 硬重置：将锁帧的预测位姿替换为 GT 位姿
-                    if align_mode == "full" and seg_start < len(gt_poses_arr):
-                        extri_np[seg_start] = gt_poses_arr[seg_start]
                     print(
                         f"[longstream][correction] seq={seq.name}"
-                        f" frame={seg_start} scale={seg_scale:.4f}",
+                        f" frame={seg_start} scale={scale_corrections[seg_start]:.4f}",
                         flush=True,
                     )
-                # 将校正后的 extri_np 重新写入位姿文件
+                # 保存校正后位姿
                 pose_dir = os.path.join(seq_dir, "poses")
                 _ensure_dir(pose_dir)
                 save_w2c_txt(
                     os.path.join(pose_dir, "abs_pose_corrected.txt"), extri_np, frame_ids
+                )
+
+            # ============================================================
+            # 保存 frame_index_map.json（筛帧映射）
+            # ============================================================
+            save_fmap = bool(filter_cfg.get("save_frame_index_map", True))
+            if save_fmap and seq.original_frame_indices is not None:
+                save_frame_index_map(
+                    os.path.join(seq_dir, "frame_index_map.json"),
+                    seq.original_frame_indices,
+                    image_paths=seq.image_paths,
                 )
 
             if save_images:
@@ -350,8 +418,7 @@ def run_inference_cfg(cfg: dict):
                 depth = outputs["depth"][0, :, :, :, 0].detach().cpu().numpy()
                 # 应用尺度补偿系数（来自 GT 位姿校正）
                 if correction_enabled and np.any(scale_corrections != 1.0):
-                    for i in range(S):
-                        depth[i] = depth[i] * float(scale_corrections[i])
+                    depth = _apply_depth_corrections(depth, scale_corrections)
                 depth_dir = os.path.join(seq_dir, "depth", "dpt")
                 _ensure_dir(depth_dir)
                 color_dir = os.path.join(seq_dir, "depth", "dpt_plasma")
@@ -374,34 +441,26 @@ def run_inference_cfg(cfg: dict):
                         os.path.join(color_dir, "frame_*.png"),
                     )
 
+            # ============================================================
+            # 点云导出：统一使用校正后的 extri_np/intri_np
+            # ============================================================
             if save_points:
                 print(
                     f"[longstream] sequence {seq.name}: saving point clouds", flush=True
                 )
-                if outputs.get("world_points") is not None:
-                    if "rel_pose_enc" in outputs:
-                        abs_pose_enc = compose_abs_from_rel(
-                            outputs["rel_pose_enc"][0], keyframe_indices[0]
-                        )
-                        extri, intri = pose_encoding_to_extri_intri(
-                            abs_pose_enc[None], image_size_hw=(H, W)
-                        )
-                    else:
-                        extri, intri = pose_encoding_to_extri_intri(
-                            outputs["pose_enc"][0][None], image_size_hw=(H, W)
-                        )
-                    extri = extri[0]
-                    intri = intri[0]
-
+                # --- point_head 分支 ---
+                if outputs.get("world_points") is not None and extri_np is not None:
                     pts_dir = os.path.join(seq_dir, "points", "point_head")
                     _ensure_dir(pts_dir)
                     pts = outputs["world_points"][0].detach().cpu().numpy()
                     full_pts = []
                     full_cols = []
                     for i in range(S):
-                        pts_world = _camera_points_to_world(
-                            pts[i], extri[i].detach().cpu().numpy()
-                        )
+                        pts_cam = pts[i]
+                        # 尺度校正（与 dpt_unproj 保持一致）
+                        if correction_enabled and scale_corrections[i] != 1.0:
+                            pts_cam = pts_cam * float(scale_corrections[i])
+                        pts_world = _camera_points_to_world(pts_cam, extri_np[i])
                         pts_world = pts_world.reshape(pts[i].shape)
                         pts_i, cols_i = _mask_points_and_colors(
                             pts_world,
@@ -427,40 +486,36 @@ def run_inference_cfg(cfg: dict):
                         seed=0,
                     )
 
-                if outputs.get("depth") is not None and (
-                    "rel_pose_enc" in outputs or "pose_enc" in outputs
+                # --- dpt_unproj 分支 ---
+                if (
+                    outputs.get("depth") is not None
+                    and extri_np is not None
+                    and intri_np is not None
                 ):
-                    depth = outputs["depth"][0, :, :, :, 0]
-                    if "rel_pose_enc" in outputs:
-                        abs_pose_enc = compose_abs_from_rel(
-                            outputs["rel_pose_enc"][0], keyframe_indices[0]
-                        )
-                        extri, intri = pose_encoding_to_extri_intri(
-                            abs_pose_enc[None], image_size_hw=(H, W)
-                        )
-                    else:
-                        extri, intri = pose_encoding_to_extri_intri(
-                            outputs["pose_enc"][0][None], image_size_hw=(H, W)
-                        )
+                    depth_for_pts = outputs["depth"][0, :, :, :, 0]
+                    # 对深度做尺度校正（与保存的深度一致）
+                    if correction_enabled and np.any(scale_corrections != 1.0):
+                        depth_for_pts = depth_for_pts.clone()
+                        for i in range(S):
+                            depth_for_pts[i] = depth_for_pts[i] * float(scale_corrections[i])
 
-                    extri = extri[0]
-                    intri = intri[0]
                     dpt_pts_dir = os.path.join(seq_dir, "points", "dpt_unproj")
                     _ensure_dir(dpt_pts_dir)
                     full_pts = []
                     full_cols = []
+                    intri_torch = torch.from_numpy(intri_np).to(depth_for_pts.device)
 
                     for i in range(S):
-                        d = depth[i]
-                        pts_cam = unproject_depth_to_points(d[None], intri[i : i + 1])[
-                            0
-                        ]
-                        R = extri[i, :3, :3]
-                        t = extri[i, :3, 3]
+                        d = depth_for_pts[i]
+                        pts_cam = unproject_depth_to_points(
+                            d[None], intri_torch[i : i + 1]
+                        )[0]
+                        R_np = extri_np[i, :3, :3]
+                        t_np = extri_np[i, :3, 3]
+                        pts_cam_np = pts_cam.cpu().numpy().reshape(-1, 3)
                         pts_world = (
-                            R.t() @ (pts_cam.reshape(-1, 3).t() - t[:, None])
-                        ).t()
-                        pts_world = pts_world.cpu().numpy().reshape(-1, 3)
+                            R_np.T @ (pts_cam_np.T - t_np[:, None])
+                        ).T.astype(np.float32)
                         pts_i, cols_i = _mask_points_and_colors(
                             pts_world,
                             rgb[i],

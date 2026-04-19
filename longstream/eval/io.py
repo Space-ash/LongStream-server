@@ -38,6 +38,31 @@ def read_pred_w2c_txt(path):
     return frames, poses
 
 
+def read_pred_w2c_txt_with_frame_map(pred_pose_path, frame_map=None):
+    """
+    读取预测 w2c 位姿，并可选地通过 frame_map 将推理帧 ID 映射回原始帧 ID。
+
+    Args:
+        pred_pose_path: abs_pose.txt 或 abs_pose_corrected.txt 路径。
+        frame_map:      来自 frame_index_map.json 的 kept_indices 列表，
+                        即 frame_map[infer_idx] = original_idx。
+                        为 None 时不做映射。
+
+    Returns:
+        (original_frame_ids, poses) —— 帧 ID 为原始序列中的帧号。
+    """
+    frames, poses = read_pred_w2c_txt(pred_pose_path)
+    if frame_map is None or not frames:
+        return frames, poses
+    mapped_frames = []
+    for f in frames:
+        if 0 <= f < len(frame_map):
+            mapped_frames.append(frame_map[f])
+        else:
+            mapped_frames.append(f)
+    return mapped_frames, poses
+
+
 def read_opencv_camera_yml(extri_path, intri_path=None):
     if not os.path.exists(extri_path):
         return {}, {}, {}

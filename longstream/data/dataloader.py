@@ -9,6 +9,7 @@ import torch
 
 from longstream.utils.vendor.dust3r.utils.image import load_images_for_eval
 from longstream.utils.filter import is_high_quality
+from longstream.utils.gt_pose import resolve_gt_poses, subset_pose_array
 
 dataset_metadata: Dict[str, Dict[str, Any]] = {
     "davis": {
@@ -163,6 +164,8 @@ class LongStreamSequence:
         image_dir: Optional[str] = None,
         camera: Optional[str] = None,
         gt_poses: Optional[np.ndarray] = None,
+        original_frame_indices: Optional[List[int]] = None,
+        gt_poses_source: str = "none",
     ):
         self.name = name
         self.images = images
@@ -171,8 +174,11 @@ class LongStreamSequence:
         self.image_dir = image_dir
         self.camera = camera
         # GT poses as [S, 4, 4] float32 array (world-to-camera, first frame = identity).
-        # Loaded from gt_poses.npy in scene_root when available.
         self.gt_poses: Optional[np.ndarray] = gt_poses
+        # 筛帧后保留帧的原始索引（未筛帧时为 None表示顺序完整）
+        self.original_frame_indices: Optional[List[int]] = original_frame_indices
+        # GT 位姿来源标记: "camera_yml" | "npy" | "none"
+        self.gt_poses_source: str = gt_poses_source
 
 
 def _read_list_file(path: str) -> List[str]:
@@ -222,8 +228,9 @@ class LongStreamDataLoader:
         self.split = cfg.get("split", None)
         self.camera = cfg.get("camera", None)
 
-        # --- vKITTI2 / GT 位姿校正 ---
-        # gt_poses_file: 相对于 scene_root 的 gt_poses.npy 路径（默认自动发现）
+        # --- GT 位姿来源 ---
+        # gt_source: "camera_yml" | "npy" | "auto"  优先 cameras/extri.yml，退回 gt_poses.npy
+        self.gt_source: str = str(cfg.get("gt_source", "auto"))
         self.gt_poses_file: Optional[str] = cfg.get("gt_poses_file", "gt_poses.npy")
 
         # --- 帧质量过滤 ---
@@ -461,42 +468,44 @@ class LongStreamDataLoader:
             )
         return kept_paths, kept_indices
 
-    def _load_gt_poses(
-        self, scene_root: Optional[str], kept_indices: Optional[List[int]]
-    ) -> Optional[np.ndarray]:
+    def _resolve_gt_poses(
+        self,
+        scene_root: Optional[str],
+        camera: Optional[str],
+        kept_indices: Optional[List[int]],
+    ) -> Tuple[Optional[np.ndarray], str]:
         """
-        从 scene_root/gt_poses.npy 加载 GT 位姿（[S, 4, 4]）。
+        统一的 GT 位姿加载入口。
+
+        优先从 cameras/<cam>/extri.yml 读取，没有时退回 gt_poses.npy。
         若 kept_indices 不为 None，则按索引取对应帧的位姿。
-        文件不存在时静默返回 None。
+
+        Returns:
+            (poses, source_tag)
         """
-        if scene_root is None or self.gt_poses_file is None:
-            return None
+        if scene_root is None:
+            return None, "none"
 
-        poses_path = os.path.join(scene_root, self.gt_poses_file)
-        if not os.path.isfile(poses_path):
-            return None
-
-        try:
-            poses = np.load(poses_path)  # [N, 4, 4]
-        except Exception as e:
-            print(
-                f"[longstream][gt_poses] 加载失败 {poses_path}: {e}",
-                flush=True,
-            )
-            return None
+        npy_name = self.gt_poses_file if self.gt_poses_file else "gt_poses.npy"
+        poses, source_tag = resolve_gt_poses(
+            scene_root,
+            camera=camera,
+            gt_source=self.gt_source,
+            npy_name=npy_name,
+        )
+        if poses is None:
+            return None, "none"
 
         if kept_indices is not None:
-            valid = [i for i in kept_indices if i < len(poses)]
-            if valid:
-                poses = poses[valid]
-            else:
-                return None
+            poses = subset_pose_array(poses, kept_indices)
+            if len(poses) == 0:
+                return None, "none"
 
         print(
-            f"[longstream][gt_poses] 已加载 {len(poses)} 帧位姿 from {poses_path}",
+            f"[longstream][gt_poses] 已加载 {len(poses)} 帧位姿 (source={source_tag})",
             flush=True,
         )
-        return poses.astype(np.float32, copy=False)
+        return poses, source_tag
 
     def __iter__(self) -> Iterator[LongStreamSequence]:
         for info in self.iter_sequence_infos():
@@ -504,10 +513,12 @@ class LongStreamDataLoader:
                 f"[longstream] loading sequence {info.name}: {len(info.image_paths)} frames",
                 flush=True,
             )
-            # 帧质量过滤（可选）
+            # 帧质量过滤（可选）—— 筛帧和 GT 子采样一次完成
             filtered_paths, kept_indices = self._filter_image_paths(info.image_paths)
-            # GT 位姿加载（可选）
-            gt_poses = self._load_gt_poses(info.scene_root, kept_indices)
+            # GT 位姿加载（统一入口，带筛帧子采样）
+            gt_poses, gt_source = self._resolve_gt_poses(
+                info.scene_root, info.camera, kept_indices
+            )
 
             images = self._load_images(filtered_paths)
             print(
@@ -522,4 +533,6 @@ class LongStreamDataLoader:
                 image_dir=info.image_dir,
                 camera=info.camera,
                 gt_poses=gt_poses,
+                original_frame_indices=kept_indices,
+                gt_poses_source=gt_source,
             )

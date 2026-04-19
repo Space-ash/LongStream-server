@@ -15,8 +15,10 @@ from longstream.eval.io import (
     read_opencv_camera_yml,
     read_pointcloud_xyz,
     read_pred_w2c_txt,
+    read_pred_w2c_txt_with_frame_map,
 )
 from longstream.eval.metrics import ate_rmse, chamfer_and_f1, transform_points
+from longstream.io.frame_index_map import load_frame_index_map
 from longstream.utils.sky_mask import sky_mask_filename
 
 
@@ -66,6 +68,22 @@ def _load_gt_pose_data(seq_info):
         return None, None, None
     extri, intri, image_sizes = read_opencv_camera_yml(extri_path, intri_path)
     return extri, intri, image_sizes
+
+
+def _resolve_pred_pose_path(seq_dir, cfg):
+    """优先选择 abs_pose_corrected.txt，无校正时退回 abs_pose.txt。"""
+    corr_cfg = cfg.get("optimizations", {}).get("correction", {})
+    use_corrected = bool(corr_cfg.get("use_corrected_pose_for_eval", True))
+    if use_corrected:
+        corrected = os.path.join(seq_dir, "poses", "abs_pose_corrected.txt")
+        if os.path.isfile(corrected):
+            return corrected
+    return os.path.join(seq_dir, "poses", "abs_pose.txt")
+
+
+def _resolve_sequence_frame_mapping(seq_dir):
+    """读取推理时保存的 frame_index_map.json，返回 kept_indices 或 None。"""
+    return load_frame_index_map(os.path.join(seq_dir, "frame_index_map.json"))
 
 
 def _resolve_gt_depth_root(seq_info):
@@ -267,7 +285,7 @@ def _evaluate_pointclouds(seq_info, seq_dir, eval_cfg, pose_align, gt_cloud):
     return metrics_by_branch or None
 
 
-def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg):
+def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=None):
     pred_dir = os.path.join(seq_dir, "depth", "dpt")
     gt_dir = _resolve_gt_depth_root(seq_info)
     if not os.path.isdir(pred_dir) or gt_dir is None:
@@ -284,10 +302,20 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg):
     evaluated_frames = 0
 
     stems = frame_stems(seq_info.image_paths)
-    for frame_id, stem in enumerate(stems):
-        pred_path = os.path.join(pred_dir, f"frame_{frame_id:06d}.npy")
+
+    # 构建 (推理帧索引, 原始帧索引) 对，筛帧后保证帧对齐
+    if frame_mapping is not None:
+        eval_pairs = list(enumerate(frame_mapping))
+    else:
+        eval_pairs = [(i, i) for i in range(len(stems))]
+
+    for infer_idx, orig_idx in eval_pairs:
+        if orig_idx < 0 or orig_idx >= len(stems):
+            continue
+        stem = stems[orig_idx]
+        pred_path = os.path.join(pred_dir, f"frame_{infer_idx:06d}.npy")
         gt_path = _resolve_gt_depth_path(
-            seq_info, gt_dir, seq_info.image_paths[frame_id], stem
+            seq_info, gt_dir, seq_info.image_paths[orig_idx], stem
         )
         if not os.path.exists(pred_path) or gt_path is None:
             continue
@@ -307,7 +335,7 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg):
         if not np.any(valid):
             continue
 
-        sky_mask_path = _sky_mask_path(seq_dir, seq_info.image_paths[frame_id])
+        sky_mask_path = _sky_mask_path(seq_dir, seq_info.image_paths[orig_idx])
         if os.path.exists(sky_mask_path):
             sky_mask = cv2.imread(sky_mask_path, cv2.IMREAD_GRAYSCALE)
             if sky_mask is not None:
@@ -348,8 +376,8 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg):
     }
 
 
-def _extract_pose_pairs(seq_info, pred_pose_path, gt_extri):
-    frame_ids, pred_w2c = read_pred_w2c_txt(pred_pose_path)
+def _extract_pose_pairs(seq_info, pred_pose_path, gt_extri, frame_mapping=None):
+    frame_ids, pred_w2c = read_pred_w2c_txt_with_frame_map(pred_pose_path, frame_mapping)
     if not pred_w2c:
         return None
 
@@ -412,7 +440,7 @@ def _save_traj_plot_3d(path, pred_xyz, gt_xyz):
     plt.close(fig)
 
 
-def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg):
+def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=None):
     seq_dir = _sequence_output_dir(output_root, seq_info.name)
     result = {
         "sequence": seq_info.name,
@@ -422,14 +450,19 @@ def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg):
         "has_gt_depth": False,
     }
 
+    # 读取帧映射（推理产物）以确保评估对齐推理结果
+    frame_mapping = _resolve_sequence_frame_mapping(seq_dir)
+    if frame_mapping is not None:
+        result["frame_mapping"] = frame_mapping
+
     gt_extri, gt_intri, _ = _load_gt_pose_data(seq_info)
     pose_align = None
     if gt_extri:
         result["has_gt"] = True
         result["has_gt_pose"] = True
 
-        pred_pose_path = os.path.join(seq_dir, "poses", "abs_pose.txt")
-        pairs = _extract_pose_pairs(seq_info, pred_pose_path, gt_extri)
+        pred_pose_path = _resolve_pred_pose_path(seq_dir, cfg or {})
+        pairs = _extract_pose_pairs(seq_info, pred_pose_path, gt_extri, frame_mapping)
         if pairs is not None:
             pred_xyz, gt_xyz = pairs
             pose_metrics = ate_rmse(
@@ -453,7 +486,7 @@ def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg):
             pose_metrics["traj_3d_plot"] = plot_path
             result["pose"] = pose_metrics
 
-    video_dpt_metrics = _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg)
+    video_dpt_metrics = _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping)
     if video_dpt_metrics is not None:
         result["has_gt"] = True
         result["has_gt_depth"] = True
@@ -495,6 +528,11 @@ def _mean_metric(sequence_results, group_name, metric_name):
 def evaluate_predictions_cfg(cfg):
     data_cfg = dict(cfg.get("data", {}))
     data_cfg["format"] = "generalizable"
+    # 将筛帧配置注入评估数据加载
+    opt_cfg = cfg.get("optimizations", {})
+    filter_cfg = opt_cfg.get("filter", {})
+    if filter_cfg:
+        data_cfg["filter"] = filter_cfg
     output_cfg = cfg.get("output", {})
     eval_cfg = cfg.get("evaluation", {})
     output_root = output_cfg.get("root", "outputs")
@@ -504,7 +542,7 @@ def evaluate_predictions_cfg(cfg):
     sequence_results = []
     for seq_info in loader.iter_sequence_infos():
         print(f"[longstream] eval {seq_info.name}: start", flush=True)
-        metrics = evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg)
+        metrics = evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=cfg)
         sequence_results.append(metrics)
         metrics_path = _sequence_metrics_path(output_root, seq_info.name)
         _ensure_dir(os.path.dirname(metrics_path))

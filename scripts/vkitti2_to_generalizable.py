@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import cv2
 import argparse
 import numpy as np
@@ -10,6 +12,14 @@ from easyvolcap.utils.base_utils import dotdict
 from easyvolcap.utils.data_utils import save_image, load_image
 from easyvolcap.utils.parallel_utils import parallel_execution
 from easyvolcap.utils.easy_utils import read_camera, write_camera
+
+# 把项目根目录加入 sys.path 以便导入 longstream 包
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from longstream.utils.gt_pose import anchor_w2c_sequence, save_gt_pose_npy
+from scripts.preprocess_vkitti2 import parse_vkitti2_extrinsic_txt
 
 
 # Define some global variables for vkitti2
@@ -91,15 +101,15 @@ def main():
             cam0.D = np.zeros((1, 5), dtype=np.float32)
             cam1.D = np.zeros((1, 5), dtype=np.float32)
 
-            # Link RGB image
+            # Link/copy RGB image (cross-platform)
             img0_path = join(tar_root, easyvolcap_img_dir, '00', f'{tidx:05d}.jpg')
             if not exists(img0_path):
                 os.makedirs(dirname(img0_path), exist_ok=True)
-                os.system(f"ln -sfn {abspath(join(src_root, vkitti2_img_pattern0.format(frame=sidx)))} {img0_path}")
+                _link_or_copy(abspath(join(src_root, vkitti2_img_pattern0.format(frame=sidx))), img0_path)
             img1_path = join(tar_root, easyvolcap_img_dir, '01', f'{tidx:05d}.jpg')
             if not exists(img1_path):
                 os.makedirs(dirname(img1_path), exist_ok=True)
-                os.system(f"ln -sfn {abspath(join(src_root, vkitti2_img_pattern1.format(frame=sidx)))} {img1_path}")
+                _link_or_copy(abspath(join(src_root, vkitti2_img_pattern1.format(frame=sidx))), img1_path)
 
             # Write the depth map
             dpt0_path = join(tar_root, easyvolcap_dpt_dir, '00', f'{tidx:05d}.exr')
@@ -129,9 +139,12 @@ def main():
             print_progress=True,
         )
 
-        # Write the camera data
+        # Write the camera data (cameras/<cam>/extri.yml + intri.yml = 主真值)
         write_camera(camera0, join(tar_root, easyvolcap_cam_dir, '00'))
         write_camera(camera1, join(tar_root, easyvolcap_cam_dir, '01'))
+
+        # Export gt_poses.npy cache for each camera
+        export_vkitti2_gt_pose_cache(src_root, tar_root, inds)
 
         # Logging
         log(green(f"Processed scene {cyan(scene)}, total {len(inds):04d} views"))
@@ -159,6 +172,32 @@ def main():
     # Process each scene
     for subscene in subscenes:
         process_scene(subscene)
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """跨平台 symlink / copy helper：优先 symlink，不支持时退回 shutil.copy2。"""
+    try:
+        os.symlink(src, dst)
+    except (OSError, NotImplementedError):
+        shutil.copy2(src, dst)
+
+
+def export_vkitti2_gt_pose_cache(src_root: str, tar_root: str, inds: list) -> None:
+    """在 tar_root 生成 gt_poses_00.npy / gt_poses_01.npy（锚定到第 0 帧的 w2c）。"""
+    extrinsic_path = join(src_root, 'extrinsic.txt')
+    if not exists(extrinsic_path):
+        return
+    for cam_id, cam_name in [(0, '00'), (1, '01')]:
+        raw_poses = parse_vkitti2_extrinsic_txt(extrinsic_path, camera_id=cam_id)
+        if not raw_poses:
+            continue
+        sorted_keys = sorted(raw_poses.keys())
+        w2c_seq = np.stack([raw_poses[k] for k in sorted_keys], axis=0)
+        anchored = anchor_w2c_sequence(w2c_seq)
+        save_gt_pose_npy(join(tar_root, f'gt_poses_{cam_name}.npy'), anchored)
+        # 同时生成不带后缀的 gt_poses.npy（兼容旧流程，默认取 Camera 0）
+        if cam_id == 0:
+            save_gt_pose_npy(join(tar_root, 'gt_poses.npy'), anchored)
 
 
 if __name__ == "__main__":
