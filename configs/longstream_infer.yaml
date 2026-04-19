@@ -1,25 +1,42 @@
+# =========================
+# LongStream 重建 / 点云 / 评估配置
+# 说明：
+# - 这个文件只放“重建与评估阶段”参数。
+# - 原始数据预处理、抽帧、Depth Anything V2 等参数见 configs/preprocess.yaml。
+# - 推荐做对比实验时优先改 enabled / save_* 这类布尔开关。
+# =========================
+
 device: cuda
 
+# -------------------------
+# 模型与权重
+# -------------------------
 model:
   checkpoint: checkpoints/50_longstream.pt
   strict_load: false
+
   hf:
     repo_id: null
     filename: null
     revision: null
     local_dir: checkpoints
+
   longstream_cfg:
     img_size: 518
     patch_size: 14
     embed_dim: 1024
     window_size: 48
+
+    # 可开关模块：适合做消融实验
     use_role_embedding: false
     enable_scale_token: true
     disable_keyframe_distinction: true
     use_segment_mask: false
     enable_camera_head: false
-    freeze: none
     use_rel_pose_head: true
+
+    freeze: none            # none | encoder
+
     rel_pose_head_cfg:
       enabled: true
       keyframe_mode: fixed
@@ -42,56 +59,81 @@ model:
       use_global_scale: false
       reinit_camera_head: false
 
+# -------------------------
+# 推理 / 流式重建控制
+# -------------------------
 inference:
-  mode: batch_refresh
-  streaming_mode: causal
+  mode: batch_refresh       # batch_refresh | streaming_refresh
+  streaming_mode: causal    # causal | window
   window_size: 48
   keyframe_mode: fixed
   keyframe_stride: 8
   refresh: 4
+
   rel_pose_head_cfg:
     num_iterations: 4
 
+# -------------------------
+# 数据加载
+# -------------------------
 data:
   format: generalizable
   data_roots_file: data_roots.txt
-  camera: "00"
   img_path: prepared_inputs/preprocess/final
   seq_list: [zhan_1_1fps]
+  camera: "00"
+
+  # 输入尺度 / 截断参数
   stride: 1
   max_frames: null
   size: 518
   crop: false
   patch_size: 14
-  gt_source: auto             # camera_yml | npy | auto（优先 cameras/extri.yml，退回 gt_poses.npy）
-  gt_poses_file: gt_poses.npy # 相对于 scene_root 的 npy 缓存路径
 
+  # GT 位姿来源
+  gt_source: auto           # camera_yml | npy | auto
+  gt_poses_file: gt_poses.npy
+
+# -------------------------
+# 重建阶段优化开关
+# -------------------------
 optimizations:
-  # 优化1：输入预筛选
+  # 输入预筛选
   filter:
     enabled: true
-    blur_threshold: 100.0   # 拉普拉斯方差阈值，低于此值视为模糊帧
-    motion_threshold: 0.02  # 帧间均值绝对差阈值（0-1归一化），低于此值视为冗余帧
-    save_frame_index_map: true  # 推理时保存 frame_index_map.json
-  # 优化2：GT位姿校正
+    blur_threshold: 100.0
+    motion_threshold: 0.02
+    save_frame_index_map: true
+
+  # 周期性 GT 校正
   correction:
     enabled: true
-    interval: 10            # 每10帧进行一次尺度/位姿校正
-    align_mode: "full"      # full (位姿+尺度) 或 scale_only
-    use_corrected_pose_for_eval: true  # 评估时优先使用校正后位姿
+    interval: 10
+    align_mode: full        # full | scale_only
+    use_corrected_pose_for_eval: true
 
+# -------------------------
+# 输出控制
+# save_* 开关非常适合做速度 / 显存 / 磁盘占用对比
+# -------------------------
 output:
   root: outputs/zhan_1_1fps
+
   save_videos: true
+  save_images: true
+  save_depth: true
   save_points: true
   save_frame_points: true
-  save_depth: true
-  save_images: true
+
   mask_sky: true
-  max_full_pointcloud_points: 2000000
-  max_frame_pointcloud_points: 200000
   skyseg_path: model/skyseg.onnx
 
+  max_full_pointcloud_points: 2000000
+  max_frame_pointcloud_points: 200000
+
+# -------------------------
+# 评估参数
+# -------------------------
 evaluation:
   align_scale: true
   depth_rel_delta_threshold: 1.25
