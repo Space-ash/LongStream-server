@@ -4,14 +4,8 @@ import shutil
 import cv2
 import argparse
 import numpy as np
-from tqdm import tqdm
-from scipy.spatial.transform import Rotation as R
-
-from easyvolcap.utils.console_utils import *
-from easyvolcap.utils.base_utils import dotdict
-from easyvolcap.utils.data_utils import save_image, load_image
-from easyvolcap.utils.parallel_utils import parallel_execution
-from easyvolcap.utils.easy_utils import read_camera, write_camera
+from concurrent.futures import ThreadPoolExecutor
+from os.path import abspath, dirname, exists, join
 
 # 把项目根目录加入 sys.path 以便导入 longstream 包
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +26,68 @@ vkitti2_dpt_pattern1 = 'frames/depth/Camera_1/depth_{frame:05d}.png'
 easyvolcap_img_dir = 'images'
 easyvolcap_dpt_dir = 'depths'
 easyvolcap_cam_dir = 'cameras'
+
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _write_exr(path: str, image: np.ndarray) -> None:
+    os.makedirs(dirname(path), exist_ok=True)
+    ok = cv2.imwrite(path, image.astype(np.float32))
+    if not ok:
+        raise RuntimeError(
+            f"failed to write EXR: {path}. "
+            "Ensure OpenCV is built with OpenEXR support or set OPENCV_IO_ENABLE_OPENEXR=1."
+        )
+
+
+def _write_camera(camera_dict: dict, out_dir: str) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    names = sorted(camera_dict.keys())
+
+    extri_path = join(out_dir, "extri.yml")
+    fs_extri = cv2.FileStorage(extri_path, cv2.FILE_STORAGE_WRITE)
+    fs_extri.startWriteStruct("names", cv2.FileNode_SEQ)
+    for name in names:
+        fs_extri.write("", name)
+    fs_extri.endWriteStruct()
+    for name in names:
+        cam = camera_dict[name]
+        fs_extri.write(f"Rot_{name}", np.asarray(cam["R"], dtype=np.float64))
+        fs_extri.write(f"T_{name}", np.asarray(cam["T"], dtype=np.float64))
+    fs_extri.release()
+
+    intri_path = join(out_dir, "intri.yml")
+    fs_intri = cv2.FileStorage(intri_path, cv2.FILE_STORAGE_WRITE)
+    fs_intri.startWriteStruct("names", cv2.FileNode_SEQ)
+    for name in names:
+        fs_intri.write("", name)
+    fs_intri.endWriteStruct()
+    for name in names:
+        cam = camera_dict[name]
+        fs_intri.write(f"K_{name}", np.asarray(cam["K"], dtype=np.float64))
+        fs_intri.write(f"H_{name}", int(cam["H"]))
+        fs_intri.write(f"W_{name}", int(cam["W"]))
+    fs_intri.release()
+
+
+def _run_parallel(frame_indices, time_indices, action, num_workers: int) -> None:
+    max_workers = max(1, min(int(num_workers), len(frame_indices)))
+    if max_workers == 1:
+        for sidx, tidx in zip(frame_indices, time_indices):
+            action(sidx, tidx)
+        return
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(action, sidx, tidx)
+            for sidx, tidx in zip(frame_indices, time_indices)
+        ]
+        for future in futures:
+            future.result()
 
 
 def main():
@@ -64,12 +120,12 @@ def main():
             == len(os.listdir(join(src_root, dirname(vkitti2_dpt_pattern0))))
             == len(os.listdir(join(src_root, dirname(vkitti2_dpt_pattern1))))
         ):
-            log(red(f"Missing camera parameters or images or depth maps in {cyan(scene)}"))
+            log(f"[vkitti2] missing camera parameters or images or depth maps in {scene}")
             return
 
         # Output camera parameters
-        camera0 = dotdict()
-        camera1 = dotdict()
+        camera0 = {}
+        camera1 = {}
 
         def process_view(sidx, tidx):
             # Load camera parameters
@@ -90,16 +146,14 @@ def main():
             ) / 100.  # https://europe.naverlabs.com/proxy-virtual-worlds-vkitti-2/
 
             # Camera parameters
-            camera0[f'{tidx:05d}'] = dotdict()
-            camera1[f'{tidx:05d}'] = dotdict()
+            camera0[f'{tidx:05d}'] = {}
+            camera1[f'{tidx:05d}'] = {}
             cam0 = camera0[f'{tidx:05d}']
             cam1 = camera1[f'{tidx:05d}']
-            cam0.H, cam0.W = dpt0.shape[0], dpt0.shape[1]
-            cam1.H, cam1.W = dpt1.shape[0], dpt1.shape[1]
-            cam0.K, cam0.R, cam0.T = K0, w2c0[:3, :3], w2c0[:3, 3:]
-            cam1.K, cam1.R, cam1.T = K1, w2c1[:3, :3], w2c1[:3, 3:]
-            cam0.D = np.zeros((1, 5), dtype=np.float32)
-            cam1.D = np.zeros((1, 5), dtype=np.float32)
+            cam0["H"], cam0["W"] = dpt0.shape[0], dpt0.shape[1]
+            cam1["H"], cam1["W"] = dpt1.shape[0], dpt1.shape[1]
+            cam0["K"], cam0["R"], cam0["T"] = K0, w2c0[:3, :3], w2c0[:3, 3:]
+            cam1["K"], cam1["R"], cam1["T"] = K1, w2c1[:3, :3], w2c1[:3, 3:]
 
             # Link/copy RGB image (cross-platform)
             img0_path = join(tar_root, easyvolcap_img_dir, '00', f'{tidx:05d}.jpg')
@@ -114,12 +168,10 @@ def main():
             # Write the depth map
             dpt0_path = join(tar_root, easyvolcap_dpt_dir, '00', f'{tidx:05d}.exr')
             if not exists(dpt0_path):
-                os.makedirs(dirname(dpt0_path), exist_ok=True)
-                save_image(dpt0_path, dpt0.astype(np.float32))
+                _write_exr(dpt0_path, dpt0)
             dpt1_path = join(tar_root, easyvolcap_dpt_dir, '01', f'{tidx:05d}.exr')
             if not exists(dpt1_path):
-                os.makedirs(dirname(dpt1_path), exist_ok=True)
-                save_image(dpt1_path, dpt1.astype(np.float32))
+                _write_exr(dpt1_path, dpt1)
 
 
         # Find all views
@@ -130,24 +182,17 @@ def main():
         ]
 
         # Process all views parallelly
-        parallel_execution(
-            inds,
-            list(range(len(inds))),
-            action=process_view,
-            sequential=False,
-            num_workers=args.num_workers,
-            print_progress=True,
-        )
+        _run_parallel(inds, list(range(len(inds))), process_view, args.num_workers)
 
         # Write the camera data (cameras/<cam>/extri.yml + intri.yml = 主真值)
-        write_camera(camera0, join(tar_root, easyvolcap_cam_dir, '00'))
-        write_camera(camera1, join(tar_root, easyvolcap_cam_dir, '01'))
+        _write_camera(camera0, join(tar_root, easyvolcap_cam_dir, '00'))
+        _write_camera(camera1, join(tar_root, easyvolcap_cam_dir, '01'))
 
         # Export gt_poses.npy cache for each camera
         export_vkitti2_gt_pose_cache(src_root, tar_root, inds)
 
         # Logging
-        log(green(f"Processed scene {cyan(scene)}, total {len(inds):04d} views"))
+        log(f"[vkitti2] processed scene {scene}, total {len(inds):04d} views")
 
 
     # Process all scenes
@@ -167,7 +212,7 @@ def main():
             join(scene, f) for f in sorted(os.listdir(join(vkitti2_root, scene)))
                 if os.path.isdir(join(vkitti2_root, scene, f))
         ]
-    log(yellow(f"Found {len(subscenes)} sub-scenes in total"))
+    log(f"[vkitti2] found {len(subscenes)} sub-scenes in total")
 
     # Process each scene
     for subscene in subscenes:
