@@ -40,6 +40,33 @@ def _apply_sky_mask(depth, mask):
     return depth * m
 
 
+def _to_homogeneous_w2c(extri_np):
+    """
+    将预测位姿统一转换为齐次 4x4 w2c 矩阵序列。
+
+    `pose_encoding_to_extri_intri` 当前返回的是 [S, 3, 4] 的 [R|t]，
+    但后续 GT 校正、矩阵求逆、点云变换都假设使用 [S, 4, 4]。
+    这里统一补最后一行 [0, 0, 0, 1]，避免下游混用 3x4 / 4x4。
+    """
+    extri_np = np.asarray(extri_np)
+    if extri_np.ndim != 3:
+        raise ValueError(
+            f"Expected extrinsics with shape [S,3,4] or [S,4,4], got {extri_np.shape}"
+        )
+    if extri_np.shape[-2:] == (4, 4):
+        return extri_np.astype(np.float32, copy=False)
+    if extri_np.shape[-2:] != (3, 4):
+        raise ValueError(
+            f"Expected extrinsics with shape [S,3,4] or [S,4,4], got {extri_np.shape}"
+        )
+
+    S = extri_np.shape[0]
+    homogeneous = np.zeros((S, 4, 4), dtype=extri_np.dtype)
+    homogeneous[:, :3, :] = extri_np
+    homogeneous[:, 3, 3] = 1.0
+    return homogeneous.astype(np.float32, copy=False)
+
+
 def _camera_points_to_world(points, extri):
     pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     R = np.asarray(extri[:3, :3], dtype=np.float64)
@@ -145,7 +172,7 @@ def _decode_predicted_extri_intri(outputs, keyframe_indices, H, W):
         )
     else:
         return None, None, None
-    extri_np = extri[0].detach().cpu().numpy()
+    extri_np = _to_homogeneous_w2c(extri[0].detach().cpu().numpy())
     intri_np = intri[0].detach().cpu().numpy()
     return extri_np, intri_np, rel_pose_enc
 
@@ -168,6 +195,15 @@ def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode
         (scale_corrections, corrected_extri_np)
         scale_corrections: 逐帧尺度因子，用于深度和点云。
     """
+    if extri_np.ndim != 3 or extri_np.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"Expected predicted extrinsics with shape [S,4,4], got {extri_np.shape}"
+        )
+    if gt_poses_arr.ndim != 3 or gt_poses_arr.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"Expected GT poses with shape [S,4,4], got {gt_poses_arr.shape}"
+        )
+
     corrected = extri_np.copy()
     scale_corrections = np.ones(S, dtype=np.float32)
 
