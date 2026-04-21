@@ -4,16 +4,21 @@ set -euo pipefail
 # Prepare raw vKITTI2 into LongStream generalizable layout.
 #
 # Usage:
-#   RAW_VKITTI2_ROOT=/data/original/vkitti2 bash prepare_vkitti2.sh
-#   RAW_VKITTI2_ROOT=/data/original/vkitti2 CONFIG_PATH=configs/longstream_infer_optimized.yaml bash prepare_vkitti2.sh
-#   RAW_VKITTI2_ROOT=/data/original/vkitti2 VKITTI2_SUBSCENE=Scene01/clone bash prepare_vkitti2.sh
+#   RAW_VKITTI2_ROOT=/path/to/vkitti2_merged bash prepare_vkitti2.sh
+#   RAW_VKITTI2_ROOT=/path/to/vkitti2_merged CONFIG_PATH=configs/longstream_infer_optimized.yaml bash prepare_vkitti2.sh
+#   RAW_VKITTI2_ROOT=/path/to/vkitti2_merged VKITTI2_SUBSCENE=Scene01/clone bash prepare_vkitti2.sh
+#
+# Important:
+# - RAW_VKITTI2_ROOT must be the dataset root that directly contains Scene01, Scene02, ...
+# - Do not pass a scene directory such as .../Scene01
+# - Do not pass a subscene directory such as .../Scene01/clone
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CONFIG_PATH="${CONFIG_PATH:-configs/longstream_infer_optimized.yaml}"
-RAW_VKITTI2_ROOT="${RAW_VKITTI2_ROOT:-}"
+RAW_VKITTI2_ROOT="${RAW_VKITTI2_ROOT:-../VKITTI/vkitti2_merged}"
 PREPARED_ROOT="${PREPARED_ROOT:-}"
 VKITTI2_SUBSCENE="${VKITTI2_SUBSCENE:-}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
@@ -24,7 +29,7 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 if [[ -z "$RAW_VKITTI2_ROOT" ]]; then
-  echo "[prepare-vkitti2] error: please set RAW_VKITTI2_ROOT=/path/to/raw/vkitti2" >&2
+  echo "[prepare-vkitti2] error: please set RAW_VKITTI2_ROOT=/path/to/vkitti2_merged" >&2
   exit 1
 fi
 
@@ -74,6 +79,15 @@ if [[ ! -d "$RAW_VKITTI2_ROOT" ]]; then
 fi
 
 SCENE_ROOT="$(dirname "$VKITTI2_SUBSCENE")"
+if [[ ! -d "$RAW_VKITTI2_ROOT/$SCENE_ROOT" ]]; then
+  echo "[prepare-vkitti2] error: RAW_VKITTI2_ROOT must be the dataset root containing scene directories." >&2
+  echo "[prepare-vkitti2] expected directory: $RAW_VKITTI2_ROOT/$SCENE_ROOT" >&2
+  echo "[prepare-vkitti2] got RAW_VKITTI2_ROOT=$RAW_VKITTI2_ROOT" >&2
+  echo "[prepare-vkitti2] got VKITTI2_SUBSCENE=$VKITTI2_SUBSCENE" >&2
+  echo "[prepare-vkitti2] example:" >&2
+  echo "  RAW_VKITTI2_ROOT=/path/to/vkitti2_merged" >&2
+  exit 1
+fi
 
 echo "[prepare-vkitti2] step 1/2: converting raw vKITTI2"
 "$PYTHON_BIN" scripts/vkitti2_to_generalizable.py \
@@ -95,4 +109,3 @@ fi
 
 echo "[prepare-vkitti2] done"
 echo "[prepare-vkitti2] prepared dataset root: $PREPARED_ROOT"
-
