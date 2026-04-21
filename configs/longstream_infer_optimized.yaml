@@ -79,8 +79,8 @@ optimizations:
     save_frame_index_map: true
   correction:
     enabled: true
-    interval: 10
-    align_mode: full
+    gps_trigger_distance_m: 5.0
+    min_pred_distance: 0.0001
     use_corrected_pose_for_eval: true
 
 output:

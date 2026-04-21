@@ -75,12 +75,15 @@ def add_runtime_arguments(parser):
     parser.add_argument("--disable-filter", action="store_true", help="禁用帧质量过滤")
     parser.add_argument("--filter-blur-threshold", type=float, default=None)
     parser.add_argument("--filter-motion-threshold", type=float, default=None)
-    parser.add_argument("--enable-correction", action="store_true", help="启用 GT 位姿校正")
-    parser.add_argument("--disable-correction", action="store_true", help="禁用 GT 位姿校正")
-    parser.add_argument("--correction-interval", type=int, default=None)
+    parser.add_argument("--enable-correction", action="store_true", help="启用 GPS 松耦合尺度校正")
+    parser.add_argument("--disable-correction", action="store_true", help="禁用 GPS 松耦合尺度校正")
     parser.add_argument(
-        "--align-mode", default=None, choices=["full", "scale_only"],
-        help="校正对齐模式：full (位姿+尺度) 或 scale_only"
+        "--gps-trigger-distance", type=float, default=None,
+        help="GPS 尺度触发的最小累积路径（米），对应 optimizations.correction.gps_trigger_distance_m"
+    )
+    parser.add_argument(
+        "--min-pred-distance", type=float, default=None,
+        help="防止除零的预测路径下限，对应 optimizations.correction.min_pred_distance"
     )
     parser.add_argument(
         "--gt-source", default=None, choices=["camera_yml", "npy", "auto"],
@@ -239,10 +242,10 @@ def load_config_with_overrides(args):
         opt.setdefault("correction", {})["enabled"] = True
     if args.disable_correction:
         opt.setdefault("correction", {})["enabled"] = False
-    if args.correction_interval is not None:
-        opt.setdefault("correction", {})["interval"] = args.correction_interval
-    if args.align_mode is not None:
-        opt.setdefault("correction", {})["align_mode"] = args.align_mode
+    if args.gps_trigger_distance is not None:
+        opt.setdefault("correction", {})["gps_trigger_distance_m"] = args.gps_trigger_distance
+    if args.min_pred_distance is not None:
+        opt.setdefault("correction", {})["min_pred_distance"] = args.min_pred_distance
 
     if args.gt_source is not None:
         cfg.setdefault("data", {})

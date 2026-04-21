@@ -105,11 +105,11 @@ optimizations:
     motion_threshold: 0.02
     save_frame_index_map: true
 
-  # 周期性 GT 校正
+  # GPS 松耦合尺度校正
   correction:
     enabled: true
-    interval: 10
-    align_mode: full        # full | scale_only
+    gps_trigger_distance_m: 5.0   # 触发尺度计算的最小累积路径（米/场景单位）
+    min_pred_distance: 0.0001      # 预测路径防零下限
     use_corrected_pose_for_eval: true
 
 # -------------------------

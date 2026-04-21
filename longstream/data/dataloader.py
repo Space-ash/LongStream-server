@@ -166,6 +166,7 @@ class LongStreamSequence:
         gt_poses: Optional[np.ndarray] = None,
         original_frame_indices: Optional[List[int]] = None,
         gt_poses_source: str = "none",
+        gps_xyz: Optional[np.ndarray] = None,
     ):
         self.name = name
         self.images = images
@@ -179,6 +180,9 @@ class LongStreamSequence:
         self.original_frame_indices: Optional[List[int]] = original_frame_indices
         # GT 位姿来源标记: "camera_yml" | "npy" | "none"
         self.gt_poses_source: str = gt_poses_source
+        # 从 GT w2c 位姿提取的相机中心 [S, 3]（世界坐标系），作为虚拟 GPS 信号。
+        # 计算方式: center = -R^T @ t，严格禁止直接使用 [:3, 3]。
+        self.gps_xyz: Optional[np.ndarray] = gps_xyz
 
 
 def _read_list_file(path: str) -> List[str]:
@@ -527,6 +531,21 @@ class LongStreamDataLoader:
                 f"[longstream] loaded sequence {info.name}: {tuple(images.shape)}",
                 flush=True,
             )
+
+            # 从 GT w2c 位姿提取虚拟 GPS 相机中心坐标 [S, 3]。
+            # 数学推导：w2c 满足 p_cam = R @ p_world + t，
+            # 故相机中心 = -R^T @ t（严禁直接取 [:3, 3]）。
+            gps_xyz: Optional[np.ndarray] = None
+            if gt_poses is not None and len(gt_poses) > 0:
+                R = gt_poses[:, :3, :3].astype(np.float64)  # [S, 3, 3]
+                t = gt_poses[:, :3, 3].astype(np.float64)   # [S, 3]
+                # center_i = -(R_i^T @ t_i)，向量化实现
+                gps_xyz = -np.einsum('nji,nj->ni', R, t).astype(np.float32)
+                print(
+                    f"[longstream][gps] 已从 GT 位姿提取 {len(gps_xyz)} 帧相机中心",
+                    flush=True,
+                )
+
             yield LongStreamSequence(
                 info.name,
                 images,
@@ -537,4 +556,5 @@ class LongStreamDataLoader:
                 gt_poses=gt_poses,
                 original_frame_indices=kept_indices,
                 gt_poses_source=gt_source,
+                gps_xyz=gps_xyz,
             )

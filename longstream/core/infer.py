@@ -177,107 +177,161 @@ def _decode_predicted_extri_intri(outputs, keyframe_indices, H, W):
     return extri_np, intri_np, rel_pose_enc
 
 
-def _compute_segment_corrections(extri_np, gt_poses_arr, S, interval, align_mode):
-    """
-    段级校正：在每个锚帧计算完整校正变换 C = GT @ inv(pred)，
-    并将其传播到段内所有帧，系统性修正长期拼接漂移。
-
-    段尺度因子由段内 pred/GT 帧间相对平移范数的中位数比值决定（而非
-    单个锚帧的绝对平移），这样对世界原点不敏感且对离群帧更稳健。
-
-    align_mode="full":
-        对段内每帧传播完整校正 corrected[i] = C_anchor @ pred[i]，
-        同时修正旋转和平移漂移。
-    align_mode="scale_only":
-        仅将段尺度比例传播到段内每帧的平移分量。
-
-    Returns:
-        (scale_corrections, corrected_extri_np)
-        scale_corrections: 逐帧尺度因子，用于深度和点云。
-    """
-    if extri_np.ndim != 3 or extri_np.shape[-2:] != (4, 4):
-        raise ValueError(
-            f"Expected predicted extrinsics with shape [S,4,4], got {extri_np.shape}"
-        )
-    if gt_poses_arr.ndim != 3 or gt_poses_arr.shape[-2:] != (4, 4):
-        raise ValueError(
-            f"Expected GT poses with shape [S,4,4], got {gt_poses_arr.shape}"
-        )
-
-    corrected = extri_np.copy()
-    scale_corrections = np.ones(S, dtype=np.float32)
-
-    n_gt = len(gt_poses_arr)
-
-    # 收集有 GT 对应的锚帧
-    anchors = []
-    for seg_start in range(0, S, interval):
-        if seg_start >= n_gt:
-            break
-        anchors.append(seg_start)
-
-    if not anchors:
-        return scale_corrections, corrected
-
-    for seg_idx, a in enumerate(anchors):
-        seg_end = anchors[seg_idx + 1] if seg_idx + 1 < len(anchors) else S
-
-        # ---- 段尺度：用段内帧间相对运动中位数比值 ----
-        seg_scale = _estimate_segment_scale(extri_np, gt_poses_arr, a, seg_end)
-
-        if align_mode == "full":
-            # 完整校正变换: C @ pred[a] ≈ gt[a]
-            C_a = gt_poses_arr[a] @ np.linalg.inv(extri_np[a])
-            for i in range(a, seg_end):
-                corrected[i] = C_a @ extri_np[i]
-        else:
-            # 仅缩放平移分量
-            for i in range(a, seg_end):
-                corrected[i, :3, 3] = extri_np[i, :3, 3] * seg_scale
-
-        scale_corrections[a:seg_end] = seg_scale
-
-    return scale_corrections, corrected
-
-
-def _estimate_segment_scale(extri_np, gt_poses_arr, seg_start, seg_end):
-    """
-    估算段 [seg_start, seg_end) 的 GT/pred 尺度比。
-
-    方法：收集段内所有连续帧对 (i, i+1)（要求 GT 可用），计算帧间平移
-    范数比 ||Δt_gt|| / ||Δt_pred||，取中位数作为段尺度。
-
-    当帧间运动不足时退回到锚帧绝对平移范数比。
-    """
-    n_gt = len(gt_poses_arr)
-    ratios = []
-    upper = min(seg_end, n_gt)
-    for i in range(seg_start, upper - 1):
-        j = i + 1
-        if j >= n_gt:
-            break
-        dt_pred = np.linalg.norm(extri_np[j, :3, 3] - extri_np[i, :3, 3])
-        dt_gt = np.linalg.norm(gt_poses_arr[j, :3, 3] - gt_poses_arr[i, :3, 3])
-        if dt_pred > 1e-6:
-            ratios.append(dt_gt / dt_pred)
-
-    if ratios:
-        return float(np.median(ratios))
-
-    # 退回锚帧绝对平移范数比
-    t_pred_norm = float(np.linalg.norm(extri_np[seg_start, :3, 3]))
-    t_gt_norm = float(np.linalg.norm(gt_poses_arr[seg_start, :3, 3]))
-    if t_pred_norm > 1e-6 or t_gt_norm > 1e-6:
-        return t_gt_norm / (t_pred_norm + 1e-8)
-    return 1.0
-
-
 def _apply_depth_corrections(depth_np, scale_corrections):
     """逐帧应用尺度校正到深度图（就地修改并返回）。"""
     S = depth_np.shape[0]
     for i in range(S):
         depth_np[i] = depth_np[i] * float(scale_corrections[i])
     return depth_np
+
+
+# ============================================================
+# GPS 松耦合尺度融合工具函数
+# ============================================================
+
+def _w2c_to_camera_centers(extri_np):
+    """
+    从 [S, 4, 4] w2c 矩阵序列提取相机中心坐标 [S, 3]（世界坐标系）。
+
+    数学推导：w2c 满足 p_cam = R @ p_world + t，
+    故相机中心 = -R^T @ t。
+    使用 np.float64 保证累加精度。
+    """
+    if extri_np.ndim != 3 or extri_np.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"_w2c_to_camera_centers: 期望 [S,4,4]，实际 {extri_np.shape}"
+        )
+    extri = np.asarray(extri_np, dtype=np.float64)
+    R = extri[:, :3, :3]   # [S, 3, 3]
+    t = extri[:, :3, 3]    # [S, 3]
+    # center_i = -(R_i^T @ t_i)，向量化：-einsum('nji,nj->ni', R, t)
+    centers = -np.einsum('nji,nj->ni', R, t)  # [S, 3]
+    return centers  # float64
+
+
+def _camera_centers_to_w2c(template_extri_np, centers_xyz):
+    """
+    将修正后的相机中心坐标回写为 [S, 4, 4] w2c 矩阵，严格保留原始旋转。
+
+    由 p_cam = R @ p_world + t 及 center = -R^T @ t，
+    反推 t = -R @ center。
+    """
+    if template_extri_np.ndim != 3 or template_extri_np.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"_camera_centers_to_w2c: 期望 [S,4,4]，实际 {template_extri_np.shape}"
+        )
+    extri = np.asarray(template_extri_np, dtype=np.float64)
+    centers = np.asarray(centers_xyz, dtype=np.float64)
+    result = extri.copy()
+    R = extri[:, :3, :3]   # [S, 3, 3]
+    # new_t_i = -R_i @ center_i
+    new_t = -np.einsum('nij,nj->ni', R, centers)  # [S, 3]
+    result[:, :3, 3] = new_t
+    # 确保最后一行仍为 [0, 0, 0, 1]
+    result[:, 3, :] = 0.0
+    result[:, 3, 3] = 1.0
+    return result.astype(np.float32, copy=False)
+
+
+def _compute_gps_loose_scale_corrections(
+    extri_np,
+    gps_xyz,
+    trigger_distance_m=5.0,
+    min_pred_distance=1e-4,
+):
+    """
+    基于移动距离动态触发的松耦合 GPS 尺度校正。
+
+    算法逻辑：
+    - 遍历模型预测的相机中心轨迹，用 np.float64 累积段内路径长度。
+    - 当 pred_path >= trigger_distance_m 且该帧具有有效 GPS 时触发校正：
+        d_true = ||gps[i] - gps[seg_start]||  （直线距离）
+        scale  = d_true / pred_path
+        对段内每帧 j：corrected[j] = anchor_corr + (pred[j] - anchor_pred) * scale
+    - 段结束后以当前触发帧为新段起点，保持轨迹连续。
+    - 旋转分量完整保留，仅修正平移尺度。
+
+    参数：
+        extri_np          : [S, 4, 4] float32，预测 w2c 矩阵
+        gps_xyz           : [S, 3] float32，相机中心（世界坐标，由 GT 位姿提取）
+        trigger_distance_m: 触发尺度计算的最小累积路径（单位与场景一致）
+        min_pred_distance : 预测路径长度下限，低于此值时不触发（防止除零）
+
+    返回：
+        scale_corrections : [S] float32，逐帧尺度因子（用于深度/点云）
+        corrected_extri   : [S, 4, 4] float32，尺度重锚后的 w2c 矩阵
+    """
+    if extri_np.ndim != 3 or extri_np.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"_compute_gps_loose_scale_corrections: 期望 [S,4,4]，实际 {extri_np.shape}"
+        )
+    S = extri_np.shape[0]
+    gps = np.asarray(gps_xyz, dtype=np.float64)    # [N_gps, 3]
+    n_gps = len(gps)
+
+    # 提取预测相机中心（float64 保证精度）
+    pred_centers = _w2c_to_camera_centers(extri_np)  # [S, 3], float64
+    corrected_centers = pred_centers.copy()
+
+    scale_corrections = np.ones(S, dtype=np.float32)
+
+    seg_start_idx = 0
+    anchor_pred = pred_centers[0].copy()       # 段起点的预测中心
+    anchor_corr = corrected_centers[0].copy()  # 段起点的校正中心（初始与预测相同）
+    pred_path = np.float64(0.0)                # 当前段累积路径长度（float64）
+    last_applied_scale = np.float64(1.0)       # 最近一次有效尺度，用于尾段 flush
+
+    for i in range(1, S):
+        step = np.float64(np.linalg.norm(pred_centers[i] - pred_centers[i - 1]))
+        pred_path += step
+
+        # 当前帧无有效 GPS 时跳过
+        if i >= n_gps:
+            continue
+
+        # 触发条件：累积路径足够长且超过最小阈值
+        if pred_path < trigger_distance_m or pred_path < min_pred_distance:
+            continue
+
+        # 计算该段的真实直线距离
+        d_true = float(np.linalg.norm(gps[i] - gps[seg_start_idx]))
+
+        if d_true <= 0.0:
+            # GPS 位移为零（原地不动），跳过本次触发但重置路径计数
+            seg_start_idx = i
+            anchor_pred = pred_centers[i].copy()
+            anchor_corr = corrected_centers[i].copy()
+            pred_path = np.float64(0.0)
+            continue
+
+        scale = np.float64(d_true) / pred_path
+        last_applied_scale = scale  # 记录最后一次有效尺度
+
+        # 对段 [seg_start_idx, i] 修正相机中心
+        for j in range(seg_start_idx, i + 1):
+            delta = pred_centers[j] - anchor_pred
+            corrected_centers[j] = anchor_corr + delta * scale
+            scale_corrections[j] = float(scale)
+
+        # 以当前帧为新段起点（连续性保证）
+        seg_start_idx = i
+        anchor_pred = pred_centers[i].copy()
+        anchor_corr = corrected_centers[i].copy()
+        pred_path = np.float64(0.0)
+
+    # ------------------------------------------------------------------
+    # 尾段 flush：若最后一段路径未达到触发阈值，用最近有效尺度覆盖剩余帧，
+    # 防止尾段深度/点云保留原始漂移。仅在曾触发过校正时执行。
+    # ------------------------------------------------------------------
+    if last_applied_scale != np.float64(1.0) and seg_start_idx < S - 1:
+        for j in range(seg_start_idx + 1, S):
+            delta = pred_centers[j] - anchor_pred
+            corrected_centers[j] = anchor_corr + delta * last_applied_scale
+            scale_corrections[j] = float(last_applied_scale)
+
+    # 将校正后的相机中心回写为 w2c 矩阵（保留旋转，仅更新平移）
+    corrected_extri = _camera_centers_to_w2c(extri_np, corrected_centers)
+    return scale_corrections, corrected_extri
 
 
 def run_inference_cfg(cfg: dict):
@@ -293,8 +347,8 @@ def run_inference_cfg(cfg: dict):
     filter_cfg = opt_cfg.get("filter", {})
     corr_cfg = opt_cfg.get("correction", {})
     correction_enabled = bool(corr_cfg.get("enabled", False))
-    correction_interval = max(1, int(corr_cfg.get("interval", 10)))
-    align_mode = str(corr_cfg.get("align_mode", "full"))
+    gps_trigger_distance_m = float(corr_cfg.get("gps_trigger_distance_m", 5.0))
+    min_pred_distance = float(corr_cfg.get("min_pred_distance", 1e-4))
 
     print(f"[longstream] device={device}", flush=True)
     model = LongStreamModel(model_cfg).to(device)
@@ -420,23 +474,25 @@ def run_inference_cfg(cfg: dict):
                     )
 
             # ============================================================
-            # GT 位姿校正：段级尺度 + 锚帧硬重置
+            # GPS 松耦合尺度校正：仅修正尺度，保留纯视觉旋转
             # scale_corrections 同时用于深度和点云
             # ============================================================
             scale_corrections = np.ones(S, dtype=np.float32)
-            if correction_enabled and extri_np is not None and seq.gt_poses is not None:
-                scale_corrections, extri_np = _compute_segment_corrections(
-                    extri_np, seq.gt_poses, S, correction_interval, align_mode
+            if correction_enabled and extri_np is not None and getattr(seq, 'gps_xyz', None) is not None:
+                scale_corrections, extri_np = _compute_gps_loose_scale_corrections(
+                    extri_np=extri_np,
+                    gps_xyz=seq.gps_xyz,
+                    trigger_distance_m=gps_trigger_distance_m,
+                    min_pred_distance=min_pred_distance,
                 )
-                for seg_start in range(0, S, correction_interval):
-                    if seg_start >= len(seq.gt_poses):
-                        break
-                    print(
-                        f"[longstream][correction] seq={seq.name}"
-                        f" frame={seg_start} scale={scale_corrections[seg_start]:.4f}",
-                        flush=True,
-                    )
-                # 保存校正后位姿
+                triggered = int(np.sum(scale_corrections != 1.0))
+                print(
+                    f"[longstream][gps_correction] seq={seq.name}"
+                    f" triggered_frames={triggered}/{S}"
+                    f" scale_range=[{scale_corrections.min():.4f}, {scale_corrections.max():.4f}]",
+                    flush=True,
+                )
+                # 保存尺度重锚后的位姿
                 pose_dir = os.path.join(seq_dir, "poses")
                 _ensure_dir(pose_dir)
                 save_w2c_txt(
