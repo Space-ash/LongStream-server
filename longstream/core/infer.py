@@ -238,6 +238,8 @@ def _compute_gps_loose_scale_corrections(
     gps_xyz,
     trigger_distance_m=5.0,
     min_pred_distance=1e-4,
+    sequence_name=None,
+    image_paths=None,
 ):
     """
     基于移动距离动态触发的松耦合 GPS 尺度校正。
@@ -305,6 +307,20 @@ def _compute_gps_loose_scale_corrections(
             continue
 
         scale = np.float64(d_true) / pred_path
+        trigger_image = "N/A"
+        if image_paths is not None and 0 <= i < len(image_paths):
+            trigger_image = os.path.basename(str(image_paths[i]))
+        print(
+            "[longstream][gps_correction_trigger]"
+            f" seq={sequence_name if sequence_name is not None else 'unknown'}"
+            f" frame_idx={i}"
+            f" image={trigger_image}"
+            f" window_start_idx={seg_start_idx}"
+            f" pred_path={float(pred_path):.6f}"
+            f" d_true={float(d_true):.6f}"
+            f" scale={float(scale):.6f}",
+            flush=True,
+        )
         last_applied_scale = scale  # 记录最后一次有效尺度
 
         # 对段 [seg_start_idx, i] 修正相机中心
@@ -484,6 +500,8 @@ def run_inference_cfg(cfg: dict):
                     gps_xyz=seq.gps_xyz,
                     trigger_distance_m=gps_trigger_distance_m,
                     min_pred_distance=min_pred_distance,
+                    sequence_name=seq.name,
+                    image_paths=seq.image_paths,
                 )
                 triggered = int(np.sum(scale_corrections != 1.0))
                 print(
