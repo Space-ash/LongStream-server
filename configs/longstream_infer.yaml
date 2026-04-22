@@ -1,15 +1,16 @@
 # =========================
-# LongStream 重建 / 点云 / 评估配置
-# 说明：
-# - 这个文件只放“重建与评估阶段”参数。
-# - 原始数据预处理、抽帧、Depth Anything V2 等参数见 configs/preprocess.yaml。
-# - 推荐做对比实验时优先改 enabled / save_* 这类布尔开关。
+# LongStream reconstruction / point cloud / evaluation config
+# Notes:
+# - This file contains only reconstruction and evaluation stage settings.
+# - Preprocessing, frame selection, and Depth Anything V2 settings live in
+#   configs/preprocess.yaml.
+# - For ablations, prefer toggling boolean flags such as enabled / save_*.
 # =========================
 
 device: cuda
 
 # -------------------------
-# 模型与权重
+# Model and weights
 # -------------------------
 model:
   checkpoint: checkpoints/50_longstream.pt
@@ -27,7 +28,7 @@ model:
     embed_dim: 1024
     window_size: 48
 
-    # 可开关模块：适合做消融实验
+    # Optional modules, useful for ablations
     use_role_embedding: false
     enable_scale_token: true
     disable_keyframe_distinction: true
@@ -60,7 +61,7 @@ model:
       reinit_camera_head: false
 
 # -------------------------
-# 推理 / 流式重建控制
+# Inference / streaming reconstruction
 # -------------------------
 inference:
   mode: batch_refresh       # batch_refresh | streaming_refresh
@@ -74,7 +75,7 @@ inference:
     num_iterations: 4
 
 # -------------------------
-# 数据加载
+# Data loading
 # -------------------------
 data:
   format: generalizable
@@ -83,38 +84,40 @@ data:
   seq_list: [zhan_1_1fps]
   camera: "00"
 
-  # 输入尺度 / 截断参数
+  # Input sizing / truncation
   stride: 1
   max_frames: null
   size: 518
   crop: false
   patch_size: 14
 
-  # GT 位姿来源
+  # GT pose source
   gt_source: auto           # camera_yml | npy | auto
   gt_poses_file: gt_poses.npy
 
 # -------------------------
-# 重建阶段优化开关
+# Reconstruction-stage optimizations
 # -------------------------
 optimizations:
-  # 输入预筛选
+  # Input pre-filtering
   filter:
     enabled: true
     blur_threshold: 100.0
     motion_threshold: 0.02
+    confidence_threshold: 0.5
     save_frame_index_map: true
 
-  # GPS 松耦合尺度校正
+  # GPS loose scale correction
   correction:
     enabled: true
-    gps_trigger_distance_m: 5.0   # 触发尺度计算的最小累积路径（米/场景单位）
-    min_pred_distance: 0.0001      # 预测路径防零下限
+    gps_trigger_distance_m: 5.0   # Minimum path length to trigger scale estimation
+    min_pred_distance: 0.0001     # Lower bound to avoid divide-by-zero
+    max_frames_threshold: 50      # Frame limit for stationary / slow-motion gating
     use_corrected_pose_for_eval: true
 
 # -------------------------
-# 输出控制
-# save_* 开关非常适合做速度 / 显存 / 磁盘占用对比
+# Output controls
+# save_* flags are useful for speed / memory / storage ablations
 # -------------------------
 output:
   root: outputs/zhan_1_1fps
@@ -132,7 +135,7 @@ output:
   max_frame_pointcloud_points: 200000
 
 # -------------------------
-# 评估参数
+# Evaluation settings
 # -------------------------
 evaluation:
   align_scale: true

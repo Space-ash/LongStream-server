@@ -76,11 +76,13 @@ optimizations:
     enabled: false
     blur_threshold: 100.0
     motion_threshold: 0.02
+    confidence_threshold: 0.5
     save_frame_index_map: false
   correction:
     enabled: false
     gps_trigger_distance_m: 5.0
     min_pred_distance: 0.0001
+    max_frames_threshold: 50
     use_corrected_pose_for_eval: false
 
 output:

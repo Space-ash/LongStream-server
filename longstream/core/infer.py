@@ -87,6 +87,17 @@ def _mask_points_and_colors(points, colors, mask):
     return pts, cols
 
 
+def _combine_masks(mask_a, mask_b):
+    """将两个掩码按位 AND 合并。None 表示全通（不限制）。"""
+    if mask_a is None and mask_b is None:
+        return None
+    if mask_a is None:
+        return (mask_b > 0).astype(np.uint8)
+    if mask_b is None:
+        return (mask_a > 0).astype(np.uint8)
+    return ((mask_a > 0) & (mask_b > 0)).astype(np.uint8)
+
+
 def _resize_long_edge(arr, long_edge_size, interpolation):
     h, w = arr.shape[:2]
     scale = float(long_edge_size) / float(max(h, w))
@@ -238,26 +249,30 @@ def _compute_gps_loose_scale_corrections(
     gps_xyz,
     trigger_distance_m=5.0,
     min_pred_distance=1e-4,
+    max_frames_threshold=50,
     sequence_name=None,
     image_paths=None,
 ):
     """
-    基于移动距离动态触发的松耦合 GPS 尺度校正。
+    基于段内位移动态触发的松耦合 GPS 尺度校正（线性插值版本）。
 
     算法逻辑：
-    - 遍历模型预测的相机中心轨迹，用 np.float64 累积段内路径长度。
-    - 当 pred_path >= trigger_distance_m 且该帧具有有效 GPS 时触发校正：
-        d_true = ||gps[i] - gps[seg_start]||  （直线距离）
-        scale  = d_true / pred_path
-        对段内每帧 j：corrected[j] = anchor_corr + (pred[j] - anchor_pred) * scale
-    - 段结束后以当前触发帧为新段起点，保持轨迹连续。
+    - vo_disp = ||pred_centers[i] - pred_centers[seg_start_idx]||（段起点到当前帧直线位移）
+    - 触发条件：当前帧有有效 GPS，且 vo_disp >= trigger_distance_m，且 vo_disp >= min_pred_distance
+    - 静止/慢速门控：(i - seg_start_idx) > max_frames_threshold 且 vo_disp < trigger_distance_m 时，
+      按 scale_prev 落地当前段并重置段起点，防止长期静止累积异常分母。
+    - d_true <= 0 时按 scale_prev 落地并重置，不产生零尺度。
+    - 有效触发时对段 [seg_start_idx, i] 做 scale_prev -> scale_new 线性插值，
+      并同步更新 corrected_centers。
+    - 尾段 flush 沿用 last_applied_scale；全程未触发则退化为不做额外校正。
     - 旋转分量完整保留，仅修正平移尺度。
 
     参数：
-        extri_np          : [S, 4, 4] float32，预测 w2c 矩阵
-        gps_xyz           : [S, 3] float32，相机中心（世界坐标，由 GT 位姿提取）
-        trigger_distance_m: 触发尺度计算的最小累积路径（单位与场景一致）
-        min_pred_distance : 预测路径长度下限，低于此值时不触发（防止除零）
+        extri_np             : [S, 4, 4] float32，预测 w2c 矩阵
+        gps_xyz              : [S, 3] float32，相机中心（世界坐标，由 GT 位姿提取）
+        trigger_distance_m   : 触发尺度计算的最小段内直线位移（单位与场景一致）
+        min_pred_distance    : 预测位移下限，低于此值时不触发（防止除零）
+        max_frames_threshold : 静止门控：段内帧数超此值且未达位移阈值时强制落地
 
     返回：
         scale_corrections : [S] float32，逐帧尺度因子（用于深度/点云）
@@ -280,33 +295,50 @@ def _compute_gps_loose_scale_corrections(
     seg_start_idx = 0
     anchor_pred = pred_centers[0].copy()       # 段起点的预测中心
     anchor_corr = corrected_centers[0].copy()  # 段起点的校正中心（初始与预测相同）
-    pred_path = np.float64(0.0)                # 当前段累积路径长度（float64）
+    scale_prev = np.float64(1.0)               # 上一段有效尺度，初始为 1.0
     last_applied_scale = np.float64(1.0)       # 最近一次有效尺度，用于尾段 flush
 
-    for i in range(1, S):
-        step = np.float64(np.linalg.norm(pred_centers[i] - pred_centers[i - 1]))
-        pred_path += step
+    def _flush_segment(seg_start, seg_end_inclusive, sc):
+        """将段 [seg_start, seg_end_inclusive] 按常量尺度 sc 落地。"""
+        for j in range(seg_start, seg_end_inclusive + 1):
+            delta = pred_centers[j] - anchor_pred
+            corrected_centers[j] = anchor_corr + delta * sc
+            scale_corrections[j] = float(sc)
 
-        # 当前帧无有效 GPS 时跳过
+    for i in range(1, S):
+        # 段内位移：从段起点到当前帧的直线距离
+        vo_disp = np.float64(np.linalg.norm(pred_centers[i] - pred_centers[seg_start_idx]))
+
+        # ------------------------------------------------------------------
+        # 静止/慢速门控：段内帧数超阈值且未达位移触发条件，按 scale_prev 落地并重置
+        # ------------------------------------------------------------------
+        if (i - seg_start_idx) > max_frames_threshold and vo_disp < trigger_distance_m:
+            _flush_segment(seg_start_idx, i, scale_prev)
+            seg_start_idx = i
+            anchor_pred = pred_centers[i].copy()
+            anchor_corr = corrected_centers[i].copy()
+            continue
+
+        # 当前帧无有效 GPS 时跳过触发判断
         if i >= n_gps:
             continue
 
-        # 触发条件：累积路径足够长且超过最小阈值
-        if pred_path < trigger_distance_m or pred_path < min_pred_distance:
+        # 触发条件：段内位移足够大
+        if vo_disp < trigger_distance_m or vo_disp < min_pred_distance:
             continue
 
         # 计算该段的真实直线距离
         d_true = float(np.linalg.norm(gps[i] - gps[seg_start_idx]))
 
         if d_true <= 0.0:
-            # GPS 位移为零（原地不动），跳过本次触发但重置路径计数
+            # GPS 位移为零或数据异常，按 scale_prev 落地并重置，不产生零尺度
+            _flush_segment(seg_start_idx, i, scale_prev)
             seg_start_idx = i
             anchor_pred = pred_centers[i].copy()
             anchor_corr = corrected_centers[i].copy()
-            pred_path = np.float64(0.0)
             continue
 
-        scale = np.float64(d_true) / pred_path
+        scale_new = np.float64(d_true) / vo_disp
         trigger_image = "N/A"
         if image_paths is not None and 0 <= i < len(image_paths):
             trigger_image = os.path.basename(str(image_paths[i]))
@@ -316,30 +348,34 @@ def _compute_gps_loose_scale_corrections(
             f" frame_idx={i}"
             f" image={trigger_image}"
             f" window_start_idx={seg_start_idx}"
-            f" pred_path={float(pred_path):.6f}"
+            f" vo_disp={float(vo_disp):.6f}"
             f" d_true={float(d_true):.6f}"
-            f" scale={float(scale):.6f}",
+            f" scale_new={float(scale_new):.6f}",
             flush=True,
         )
-        last_applied_scale = scale  # 记录最后一次有效尺度
 
-        # 对段 [seg_start_idx, i] 修正相机中心
+        # 线性插值：对段 [seg_start_idx, i] 每帧 j 做 scale_prev -> scale_new 平滑过渡，
+        # 并同步更新 corrected_centers（否则 abs_pose_corrected.txt 仍存在段间阶跃）
+        seg_len = max(i - seg_start_idx, 1)
         for j in range(seg_start_idx, i + 1):
+            alpha = (j - seg_start_idx) / seg_len
+            scale_j = scale_prev + alpha * (scale_new - scale_prev)
             delta = pred_centers[j] - anchor_pred
-            corrected_centers[j] = anchor_corr + delta * scale
-            scale_corrections[j] = float(scale)
+            corrected_centers[j] = anchor_corr + delta * scale_j
+            scale_corrections[j] = float(scale_j)
 
-        # 以当前帧为新段起点（连续性保证）
+        # 更新段状态，以当前触发帧为新段起点
+        scale_prev = scale_new
+        last_applied_scale = scale_new
         seg_start_idx = i
         anchor_pred = pred_centers[i].copy()
         anchor_corr = corrected_centers[i].copy()
-        pred_path = np.float64(0.0)
 
     # ------------------------------------------------------------------
-    # 尾段 flush：若最后一段路径未达到触发阈值，用最近有效尺度覆盖剩余帧，
-    # 防止尾段深度/点云保留原始漂移。仅在曾触发过校正时执行。
+    # 尾段 flush：用 last_applied_scale 覆盖剩余未触发帧。
+    # 若全程从未触发过，last_applied_scale == 1.0，行为退化为不做额外校正。
     # ------------------------------------------------------------------
-    if last_applied_scale != np.float64(1.0) and seg_start_idx < S - 1:
+    if seg_start_idx < S - 1:
         for j in range(seg_start_idx + 1, S):
             delta = pred_centers[j] - anchor_pred
             corrected_centers[j] = anchor_corr + delta * last_applied_scale
@@ -362,9 +398,12 @@ def run_inference_cfg(cfg: dict):
     opt_cfg = cfg.get("optimizations", {})
     filter_cfg = opt_cfg.get("filter", {})
     corr_cfg = opt_cfg.get("correction", {})
+    filter_enabled = bool(filter_cfg.get("enabled", False))
     correction_enabled = bool(corr_cfg.get("enabled", False))
     gps_trigger_distance_m = float(corr_cfg.get("gps_trigger_distance_m", 5.0))
     min_pred_distance = float(corr_cfg.get("min_pred_distance", 1e-4))
+    max_frames_threshold = int(corr_cfg.get("max_frames_threshold", 50))
+    confidence_threshold = float(filter_cfg.get("confidence_threshold", 0.5))
 
     print(f"[longstream] device={device}", flush=True)
     model = LongStreamModel(model_cfg).to(device)
@@ -500,6 +539,7 @@ def run_inference_cfg(cfg: dict):
                     gps_xyz=seq.gps_xyz,
                     trigger_distance_m=gps_trigger_distance_m,
                     min_pred_distance=min_pred_distance,
+                    max_frames_threshold=max_frames_threshold,
                     sequence_name=seq.name,
                     image_paths=seq.image_paths,
                 )
@@ -566,11 +606,28 @@ def run_inference_cfg(cfg: dict):
                 color_dir = os.path.join(seq_dir, "depth", "dpt_plasma")
                 _ensure_dir(color_dir)
 
+                # 提前提取 depth_conf（容错：若不存在则置 None）
+                _raw_depth_conf = outputs.get("depth_conf")
+                depth_conf_np = None
+                if _raw_depth_conf is not None:
+                    try:
+                        dc_arr = _raw_depth_conf[0].detach().cpu().numpy()  # [S, H, W, ?]
+                        if dc_arr.ndim == 4:
+                            dc_arr = dc_arr[..., 0]  # [S, H, W]
+                        depth_conf_np = dc_arr
+                    except Exception:
+                        depth_conf_np = None
+
                 color_frames = []
                 for i in range(S):
                     d = depth[i]
-                    if sky_masks is not None and sky_masks[i] is not None:
-                        d = _apply_sky_mask(d, sky_masks[i])
+                    sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
+                    conf_m = None
+                    if filter_enabled and depth_conf_np is not None:
+                        conf_m = (depth_conf_np[i] > confidence_threshold).astype(np.uint8)
+                    combined = _combine_masks(sky_m, conf_m)
+                    if combined is not None:
+                        d = _apply_sky_mask(d, combined)
                     np.save(os.path.join(depth_dir, f"frame_{i:06d}.npy"), d)
                     colored = colorize_depth(d, cmap="plasma")
                     Image.fromarray(colored).save(
@@ -595,6 +652,17 @@ def run_inference_cfg(cfg: dict):
                     pts_dir = os.path.join(seq_dir, "points", "point_head")
                     _ensure_dir(pts_dir)
                     pts = outputs["world_points"][0].detach().cpu().numpy()
+                    # 提取 world_points_conf（容错）
+                    _raw_wpc = outputs.get("world_points_conf")
+                    wpc_np = None
+                    if _raw_wpc is not None:
+                        try:
+                            wpc_arr = _raw_wpc[0].detach().cpu().numpy()  # [S, H, W, ?]
+                            if wpc_arr.ndim == 4:
+                                wpc_arr = wpc_arr[..., 0]
+                            wpc_np = wpc_arr
+                        except Exception:
+                            wpc_np = None
                     full_pts = []
                     full_cols = []
                     for i in range(S):
@@ -604,10 +672,15 @@ def run_inference_cfg(cfg: dict):
                             pts_cam = pts_cam * float(scale_corrections[i])
                         pts_world = _camera_points_to_world(pts_cam, extri_np[i])
                         pts_world = pts_world.reshape(pts[i].shape)
+                        sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
+                        conf_m = None
+                        if filter_enabled and wpc_np is not None:
+                            conf_m = (wpc_np[i] > confidence_threshold).astype(np.uint8)
+                        valid_mask = _combine_masks(sky_m, conf_m)
                         pts_i, cols_i = _mask_points_and_colors(
                             pts_world,
                             rgb[i],
-                            None if sky_masks is None else sky_masks[i],
+                            valid_mask,
                         )
                         if save_frame_points:
                             save_pointcloud(
@@ -647,6 +720,18 @@ def run_inference_cfg(cfg: dict):
                     full_cols = []
                     intri_torch = torch.from_numpy(intri_np).to(depth_for_pts.device)
 
+                    # 提取 depth_conf（容错，dpt_unproj 分支独立提取）
+                    _raw_dconf = outputs.get("depth_conf")
+                    dconf_np = None
+                    if _raw_dconf is not None:
+                        try:
+                            dconf_arr = _raw_dconf[0].detach().cpu().numpy()  # [S, H, W, ?]
+                            if dconf_arr.ndim == 4:
+                                dconf_arr = dconf_arr[..., 0]
+                            dconf_np = dconf_arr
+                        except Exception:
+                            dconf_np = None
+
                     for i in range(S):
                         d = depth_for_pts[i]
                         pts_cam = unproject_depth_to_points(
@@ -658,10 +743,15 @@ def run_inference_cfg(cfg: dict):
                         pts_world = (
                             R_np.T @ (pts_cam_np.T - t_np[:, None])
                         ).T.astype(np.float32)
+                        sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
+                        conf_m = None
+                        if filter_enabled and dconf_np is not None:
+                            conf_m = (dconf_np[i] > confidence_threshold).astype(np.uint8)
+                        valid_mask = _combine_masks(sky_m, conf_m)
                         pts_i, cols_i = _mask_points_and_colors(
                             pts_world,
                             rgb[i],
-                            None if sky_masks is None else sky_masks[i],
+                            valid_mask,
                         )
                         if save_frame_points:
                             save_pointcloud(

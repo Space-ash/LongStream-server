@@ -86,6 +86,14 @@ def add_runtime_arguments(parser):
         help="防止除零的预测路径下限，对应 optimizations.correction.min_pred_distance"
     )
     parser.add_argument(
+        "--max-frames-threshold", type=int, default=None,
+        help="静止/慢速门控：段内帧数超此值且未触发时强制落地，对应 optimizations.correction.max_frames_threshold"
+    )
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=None,
+        help="点云/深度置信度过滤阈值，对应 optimizations.filter.confidence_threshold"
+    )
+    parser.add_argument(
         "--gt-source", default=None, choices=["camera_yml", "npy", "auto"],
         help="GT 位姿来源：camera_yml | npy | auto"
     )
@@ -246,6 +254,10 @@ def load_config_with_overrides(args):
         opt.setdefault("correction", {})["gps_trigger_distance_m"] = args.gps_trigger_distance
     if args.min_pred_distance is not None:
         opt.setdefault("correction", {})["min_pred_distance"] = args.min_pred_distance
+    if args.max_frames_threshold is not None:
+        opt.setdefault("correction", {})["max_frames_threshold"] = args.max_frames_threshold
+    if args.confidence_threshold is not None:
+        opt.setdefault("filter", {})["confidence_threshold"] = args.confidence_threshold
 
     if args.gt_source is not None:
         cfg.setdefault("data", {})
