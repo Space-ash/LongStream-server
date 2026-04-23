@@ -238,9 +238,9 @@ def load_config_with_overrides(args):
     opt = cfg.setdefault("optimizations", {})
 
     if args.enable_filter:
-        opt.setdefault("filter", {})["enabled"] = True
+        opt.setdefault("filter", {})["frame_filter_enabled"] = True
     if args.disable_filter:
-        opt.setdefault("filter", {})["enabled"] = False
+        opt.setdefault("filter", {})["frame_filter_enabled"] = False
     if args.filter_blur_threshold is not None:
         opt.setdefault("filter", {})["blur_threshold"] = args.filter_blur_threshold
     if args.filter_motion_threshold is not None:

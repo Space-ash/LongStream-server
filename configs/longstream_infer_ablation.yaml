@@ -73,7 +73,8 @@ data:
 
 optimizations:
   filter:
-    enabled: false
+    frame_filter_enabled: false
+    confidence_filter_enabled: false
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5

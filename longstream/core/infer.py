@@ -398,7 +398,15 @@ def run_inference_cfg(cfg: dict):
     opt_cfg = cfg.get("optimizations", {})
     filter_cfg = opt_cfg.get("filter", {})
     corr_cfg = opt_cfg.get("correction", {})
-    filter_enabled = bool(filter_cfg.get("enabled", False))
+    frame_filter_enabled = bool(
+        filter_cfg.get("frame_filter_enabled", filter_cfg.get("enabled", False))
+    )
+    confidence_filter_enabled = bool(
+        filter_cfg.get(
+            "confidence_filter_enabled",
+            filter_cfg.get("enabled", False),
+        )
+    )
     correction_enabled = bool(corr_cfg.get("enabled", False))
     gps_trigger_distance_m = float(corr_cfg.get("gps_trigger_distance_m", 5.0))
     min_pred_distance = float(corr_cfg.get("min_pred_distance", 1e-4))
@@ -623,7 +631,7 @@ def run_inference_cfg(cfg: dict):
                     d = depth[i]
                     sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
                     conf_m = None
-                    if filter_enabled and depth_conf_np is not None:
+                    if confidence_filter_enabled and depth_conf_np is not None:
                         conf_m = (depth_conf_np[i] > confidence_threshold).astype(np.uint8)
                     combined = _combine_masks(sky_m, conf_m)
                     if combined is not None:
@@ -674,7 +682,7 @@ def run_inference_cfg(cfg: dict):
                         pts_world = pts_world.reshape(pts[i].shape)
                         sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
                         conf_m = None
-                        if filter_enabled and wpc_np is not None:
+                        if confidence_filter_enabled and wpc_np is not None:
                             conf_m = (wpc_np[i] > confidence_threshold).astype(np.uint8)
                         valid_mask = _combine_masks(sky_m, conf_m)
                         pts_i, cols_i = _mask_points_and_colors(
@@ -745,7 +753,7 @@ def run_inference_cfg(cfg: dict):
                         ).T.astype(np.float32)
                         sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
                         conf_m = None
-                        if filter_enabled and dconf_np is not None:
+                        if confidence_filter_enabled and dconf_np is not None:
                             conf_m = (dconf_np[i] > confidence_threshold).astype(np.uint8)
                         valid_mask = _combine_masks(sky_m, conf_m)
                         pts_i, cols_i = _mask_points_and_colors(

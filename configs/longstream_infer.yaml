@@ -101,7 +101,8 @@ data:
 optimizations:
   # Input pre-filtering
   filter:
-    enabled: true
+    frame_filter_enabled: true
+    confidence_filter_enabled: true
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5

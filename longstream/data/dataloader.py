@@ -239,7 +239,12 @@ class LongStreamDataLoader:
 
         # --- 帧质量过滤 ---
         filter_cfg = cfg.get("filter", {})
-        self.filter_enabled: bool = bool(filter_cfg.get("enabled", False))
+        self.filter_enabled: bool = bool(
+            filter_cfg.get(
+                "frame_filter_enabled",
+                filter_cfg.get("enabled", False),
+            )
+        )
         self.filter_blur_threshold: float = float(
             filter_cfg.get("blur_threshold", 100.0)
         )

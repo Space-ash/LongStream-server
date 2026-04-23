@@ -72,11 +72,12 @@ data:
 
 optimizations:
   filter:
-    enabled: true
+    frame_filter_enabled: false
+    confidence_filter_enabled: true
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5
-    save_frame_index_map: true
+    save_frame_index_map: false
   correction:
     enabled: false
     gps_trigger_distance_m: 5.0
