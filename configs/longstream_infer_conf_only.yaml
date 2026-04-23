@@ -1,8 +1,7 @@
-# LongStream 重建模板：Baseline
-# 用途：
-# - 关闭筛帧和 GT 周期校正
-# - 保留基础重建与评估
-
+# LongStream reconstruction template: confidence-only
+# Use case:
+# - Enable confidence filtering only
+# - Keep GPS loose scale correction disabled for ablation comparison
 device: cuda
 
 model:
@@ -73,11 +72,11 @@ data:
 
 optimizations:
   filter:
-    enabled: false
+    enabled: true
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5
-    save_frame_index_map: false
+    save_frame_index_map: true
   correction:
     enabled: false
     gps_trigger_distance_m: 5.0
@@ -86,7 +85,7 @@ optimizations:
     use_corrected_pose_for_eval: false
 
 output:
-  root: outputs/vkitti2_scene01_clone/baseline
+  root: outputs/vkitti2_scene01_clone/conf_only
   save_videos: true
   save_images: true
   save_depth: true
