@@ -108,13 +108,15 @@ optimizations:
     confidence_threshold: 0.5
     save_frame_index_map: true
 
-  # GPS loose scale correction
+  # TTO (Test-Time Optimization): calibrate scale_token using GPS displacement
   correction:
-    enabled: true
-    gps_trigger_distance_m: 5.0   # Minimum path length to trigger scale estimation
-    min_pred_distance: 0.0001     # Lower bound to avoid divide-by-zero
-    max_frames_threshold: 50      # Frame limit for stationary / slow-motion gating
-    use_corrected_pose_for_eval: true
+    tto_enabled: true
+    tto_steps: 20
+    tto_lr: 1.0e-3
+    tto_weight_decay: 0.0
+    tto_min_gps_disp: 1.0e-4
+    tto_max_grad_norm: 1.0
+    tto_pair_stride: 8
 
 # -------------------------
 # Output controls

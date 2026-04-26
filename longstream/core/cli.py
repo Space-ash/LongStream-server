@@ -75,19 +75,27 @@ def add_runtime_arguments(parser):
     parser.add_argument("--disable-filter", action="store_true", help="禁用帧质量过滤")
     parser.add_argument("--filter-blur-threshold", type=float, default=None)
     parser.add_argument("--filter-motion-threshold", type=float, default=None)
-    parser.add_argument("--enable-correction", action="store_true", help="启用 GPS 松耦合尺度校正")
-    parser.add_argument("--disable-correction", action="store_true", help="禁用 GPS 松耦合尺度校正")
+    parser.add_argument("--enable-correction", action="store_true", help="启用 TTO（测试时优化 scale_token）")
+    parser.add_argument("--disable-correction", action="store_true", help="禁用 TTO")
     parser.add_argument(
-        "--gps-trigger-distance", type=float, default=None,
-        help="GPS 尺度触发的最小累积路径（米），对应 optimizations.correction.gps_trigger_distance_m"
+        "--tto-steps", type=int, default=None,
+        help="TTO 迭代步数，对应 optimizations.correction.tto_steps"
     )
     parser.add_argument(
-        "--min-pred-distance", type=float, default=None,
-        help="防止除零的预测路径下限，对应 optimizations.correction.min_pred_distance"
+        "--tto-lr", type=float, default=None,
+        help="TTO 学习率，对应 optimizations.correction.tto_lr"
     )
     parser.add_argument(
-        "--max-frames-threshold", type=int, default=None,
-        help="静止/慢速门控：段内帧数超此值且未触发时强制落地，对应 optimizations.correction.max_frames_threshold"
+        "--tto-pair-stride", type=int, default=None,
+        help="TTO GPS 配对步长，对应 optimizations.correction.tto_pair_stride"
+    )
+    parser.add_argument(
+        "--tto-min-gps-disp", type=float, default=None,
+        help="TTO 有效 GPS 位移最小値，对应 optimizations.correction.tto_min_gps_disp"
+    )
+    parser.add_argument(
+        "--tto-max-grad-norm", type=float, default=None,
+        help="TTO 梯度裁剪最大范数，对应 optimizations.correction.tto_max_grad_norm"
     )
     parser.add_argument(
         "--confidence-threshold", type=float, default=None,
@@ -247,15 +255,19 @@ def load_config_with_overrides(args):
         opt.setdefault("filter", {})["motion_threshold"] = args.filter_motion_threshold
 
     if args.enable_correction:
-        opt.setdefault("correction", {})["enabled"] = True
+        opt.setdefault("correction", {})["tto_enabled"] = True
     if args.disable_correction:
-        opt.setdefault("correction", {})["enabled"] = False
-    if args.gps_trigger_distance is not None:
-        opt.setdefault("correction", {})["gps_trigger_distance_m"] = args.gps_trigger_distance
-    if args.min_pred_distance is not None:
-        opt.setdefault("correction", {})["min_pred_distance"] = args.min_pred_distance
-    if args.max_frames_threshold is not None:
-        opt.setdefault("correction", {})["max_frames_threshold"] = args.max_frames_threshold
+        opt.setdefault("correction", {})["tto_enabled"] = False
+    if args.tto_steps is not None:
+        opt.setdefault("correction", {})["tto_steps"] = args.tto_steps
+    if args.tto_lr is not None:
+        opt.setdefault("correction", {})["tto_lr"] = args.tto_lr
+    if args.tto_pair_stride is not None:
+        opt.setdefault("correction", {})["tto_pair_stride"] = args.tto_pair_stride
+    if args.tto_min_gps_disp is not None:
+        opt.setdefault("correction", {})["tto_min_gps_disp"] = args.tto_min_gps_disp
+    if args.tto_max_grad_norm is not None:
+        opt.setdefault("correction", {})["tto_max_grad_norm"] = args.tto_max_grad_norm
     if args.confidence_threshold is not None:
         opt.setdefault("filter", {})["confidence_threshold"] = args.confidence_threshold
 

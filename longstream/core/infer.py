@@ -188,202 +188,38 @@ def _decode_predicted_extri_intri(outputs, keyframe_indices, H, W):
     return extri_np, intri_np, rel_pose_enc
 
 
-def _apply_depth_corrections(depth_np, scale_corrections):
-    """逐帧应用尺度校正到深度图（就地修改并返回）。"""
-    S = depth_np.shape[0]
-    for i in range(S):
-        depth_np[i] = depth_np[i] * float(scale_corrections[i])
-    return depth_np
-
-
-# ============================================================
-# GPS 松耦合尺度融合工具函数
-# ============================================================
-
-def _w2c_to_camera_centers(extri_np):
-    """
-    从 [S, 4, 4] w2c 矩阵序列提取相机中心坐标 [S, 3]（世界坐标系）。
-
-    数学推导：w2c 满足 p_cam = R @ p_world + t，
-    故相机中心 = -R^T @ t。
-    使用 np.float64 保证累加精度。
-    """
-    if extri_np.ndim != 3 or extri_np.shape[-2:] != (4, 4):
-        raise ValueError(
-            f"_w2c_to_camera_centers: 期望 [S,4,4]，实际 {extri_np.shape}"
-        )
-    extri = np.asarray(extri_np, dtype=np.float64)
-    R = extri[:, :3, :3]   # [S, 3, 3]
-    t = extri[:, :3, 3]    # [S, 3]
-    # center_i = -(R_i^T @ t_i)，向量化：-einsum('nji,nj->ni', R, t)
-    centers = -np.einsum('nji,nj->ni', R, t)  # [S, 3]
-    return centers  # float64
-
-
-def _camera_centers_to_w2c(template_extri_np, centers_xyz):
-    """
-    将修正后的相机中心坐标回写为 [S, 4, 4] w2c 矩阵，严格保留原始旋转。
-
-    由 p_cam = R @ p_world + t 及 center = -R^T @ t，
-    反推 t = -R @ center。
-    """
-    if template_extri_np.ndim != 3 or template_extri_np.shape[-2:] != (4, 4):
-        raise ValueError(
-            f"_camera_centers_to_w2c: 期望 [S,4,4]，实际 {template_extri_np.shape}"
-        )
-    extri = np.asarray(template_extri_np, dtype=np.float64)
-    centers = np.asarray(centers_xyz, dtype=np.float64)
-    result = extri.copy()
-    R = extri[:, :3, :3]   # [S, 3, 3]
-    # new_t_i = -R_i @ center_i
-    new_t = -np.einsum('nij,nj->ni', R, centers)  # [S, 3]
-    result[:, :3, 3] = new_t
-    # 确保最后一行仍为 [0, 0, 0, 1]
-    result[:, 3, :] = 0.0
-    result[:, 3, 3] = 1.0
-    return result.astype(np.float32, copy=False)
-
-
-def _compute_gps_loose_scale_corrections(
-    extri_np,
-    gps_xyz,
-    trigger_distance_m=5.0,
-    min_pred_distance=1e-4,
-    max_frames_threshold=50,
-    sequence_name=None,
-    image_paths=None,
+def _run_tto_pose_forward(
+    model,
+    images,
+    is_keyframe,
+    keyframe_indices,
+    streaming_mode,
+    rel_pose_num_iterations,
 ):
     """
-    基于段内位移动态触发的松耦合 GPS 尺度校正（线性插值版本）。
-
-    算法逻辑：
-    - vo_disp = ||pred_centers[i] - pred_centers[seg_start_idx]||（段起点到当前帧直线位移）
-    - 触发条件：当前帧有有效 GPS，且 vo_disp >= trigger_distance_m，且 vo_disp >= min_pred_distance
-    - 静止/慢速门控：(i - seg_start_idx) > max_frames_threshold 且 vo_disp < trigger_distance_m 时，
-      按 scale_prev 落地当前段并重置段起点，防止长期静止累积异常分母。
-    - d_true <= 0 时按 scale_prev 落地并重置，不产生零尺度。
-    - 有效触发时对段 [seg_start_idx, i] 做 scale_prev -> scale_new 线性插值，
-      并同步更新 corrected_centers。
-    - 尾段 flush 沿用 last_applied_scale；全程未触发则退化为不做额外校正。
-    - 旋转分量完整保留，仅修正平移尺度。
-
-    参数：
-        extri_np             : [S, 4, 4] float32，预测 w2c 矩阵
-        gps_xyz              : [S, 3] float32，相机中心（世界坐标，由 GT 位姿提取）
-        trigger_distance_m   : 触发尺度计算的最小段内直线位移（单位与场景一致）
-        min_pred_distance    : 预测位移下限，低于此值时不触发（防止除零）
-        max_frames_threshold : 静止门控：段内帧数超此值且未达位移阈值时强制落地
-
-    返回：
-        scale_corrections : [S] float32，逐帧尺度因子（用于深度/点云）
-        corrected_extri   : [S, 4, 4] float32，尺度重锚后的 w2c 矩阵
+    可微分位姿 dry-run：跳过稠密头，不更新 KV 缓存，
+    专用于 TTO 梯度反传。所有输出均保留计算图（不调用 .detach()）。
     """
-    if extri_np.ndim != 3 or extri_np.shape[-2:] != (4, 4):
-        raise ValueError(
-            f"_compute_gps_loose_scale_corrections: 期望 [S,4,4]，实际 {extri_np.shape}"
+    rel_pose_inputs = {
+        "is_keyframe": is_keyframe,
+        "keyframe_indices": keyframe_indices,
+        "num_iterations": rel_pose_num_iterations,
+    }
+    old_env = os.environ.get("SKIP_DENSE_HEADS")
+    os.environ["SKIP_DENSE_HEADS"] = "1"
+    try:
+        outputs = model(
+            images,
+            mode=streaming_mode,
+            is_keyframe=is_keyframe,
+            rel_pose_inputs=rel_pose_inputs,
         )
-    S = extri_np.shape[0]
-    gps = np.asarray(gps_xyz, dtype=np.float64)    # [N_gps, 3]
-    n_gps = len(gps)
-
-    # 提取预测相机中心（float64 保证精度）
-    pred_centers = _w2c_to_camera_centers(extri_np)  # [S, 3], float64
-    corrected_centers = pred_centers.copy()
-
-    scale_corrections = np.ones(S, dtype=np.float32)
-
-    seg_start_idx = 0
-    anchor_pred = pred_centers[0].copy()       # 段起点的预测中心
-    anchor_corr = corrected_centers[0].copy()  # 段起点的校正中心（初始与预测相同）
-    scale_prev = np.float64(1.0)               # 上一段有效尺度，初始为 1.0
-    last_applied_scale = np.float64(1.0)       # 最近一次有效尺度，用于尾段 flush
-
-    def _flush_segment(seg_start, seg_end_inclusive, sc):
-        """将段 [seg_start, seg_end_inclusive] 按常量尺度 sc 落地。"""
-        for j in range(seg_start, seg_end_inclusive + 1):
-            delta = pred_centers[j] - anchor_pred
-            corrected_centers[j] = anchor_corr + delta * sc
-            scale_corrections[j] = float(sc)
-
-    for i in range(1, S):
-        # 段内位移：从段起点到当前帧的直线距离
-        vo_disp = np.float64(np.linalg.norm(pred_centers[i] - pred_centers[seg_start_idx]))
-
-        # ------------------------------------------------------------------
-        # 静止/慢速门控：段内帧数超阈值且未达位移触发条件，按 scale_prev 落地并重置
-        # ------------------------------------------------------------------
-        if (i - seg_start_idx) > max_frames_threshold and vo_disp < trigger_distance_m:
-            _flush_segment(seg_start_idx, i, scale_prev)
-            seg_start_idx = i
-            anchor_pred = pred_centers[i].copy()
-            anchor_corr = corrected_centers[i].copy()
-            continue
-
-        # 当前帧无有效 GPS 时跳过触发判断
-        if i >= n_gps:
-            continue
-
-        # 触发条件：段内位移足够大
-        if vo_disp < trigger_distance_m or vo_disp < min_pred_distance:
-            continue
-
-        # 计算该段的真实直线距离
-        d_true = float(np.linalg.norm(gps[i] - gps[seg_start_idx]))
-
-        if d_true <= 0.0:
-            # GPS 位移为零或数据异常，按 scale_prev 落地并重置，不产生零尺度
-            _flush_segment(seg_start_idx, i, scale_prev)
-            seg_start_idx = i
-            anchor_pred = pred_centers[i].copy()
-            anchor_corr = corrected_centers[i].copy()
-            continue
-
-        scale_new = np.float64(d_true) / vo_disp
-        trigger_image = "N/A"
-        if image_paths is not None and 0 <= i < len(image_paths):
-            trigger_image = os.path.basename(str(image_paths[i]))
-        print(
-            "[longstream][gps_correction_trigger]"
-            f" seq={sequence_name if sequence_name is not None else 'unknown'}"
-            f" frame_idx={i}"
-            f" image={trigger_image}"
-            f" window_start_idx={seg_start_idx}"
-            f" vo_disp={float(vo_disp):.6f}"
-            f" d_true={float(d_true):.6f}"
-            f" scale_new={float(scale_new):.6f}",
-            flush=True,
-        )
-
-        # 线性插值：对段 [seg_start_idx, i] 每帧 j 做 scale_prev -> scale_new 平滑过渡，
-        # 并同步更新 corrected_centers（否则 abs_pose_corrected.txt 仍存在段间阶跃）
-        seg_len = max(i - seg_start_idx, 1)
-        for j in range(seg_start_idx, i + 1):
-            alpha = (j - seg_start_idx) / seg_len
-            scale_j = scale_prev + alpha * (scale_new - scale_prev)
-            delta = pred_centers[j] - anchor_pred
-            corrected_centers[j] = anchor_corr + delta * scale_j
-            scale_corrections[j] = float(scale_j)
-
-        # 更新段状态，以当前触发帧为新段起点
-        scale_prev = scale_new
-        last_applied_scale = scale_new
-        seg_start_idx = i
-        anchor_pred = pred_centers[i].copy()
-        anchor_corr = corrected_centers[i].copy()
-
-    # ------------------------------------------------------------------
-    # 尾段 flush：用 last_applied_scale 覆盖剩余未触发帧。
-    # 若全程从未触发过，last_applied_scale == 1.0，行为退化为不做额外校正。
-    # ------------------------------------------------------------------
-    if seg_start_idx < S - 1:
-        for j in range(seg_start_idx + 1, S):
-            delta = pred_centers[j] - anchor_pred
-            corrected_centers[j] = anchor_corr + delta * last_applied_scale
-            scale_corrections[j] = float(last_applied_scale)
-
-    # 将校正后的相机中心回写为 w2c 矩阵（保留旋转，仅更新平移）
-    corrected_extri = _camera_centers_to_w2c(extri_np, corrected_centers)
-    return scale_corrections, corrected_extri
+    finally:
+        if old_env is None:
+            os.environ.pop("SKIP_DENSE_HEADS", None)
+        else:
+            os.environ["SKIP_DENSE_HEADS"] = old_env
+    return outputs
 
 
 def run_inference_cfg(cfg: dict):
@@ -407,16 +243,37 @@ def run_inference_cfg(cfg: dict):
             filter_cfg.get("enabled", False),
         )
     )
-    correction_enabled = bool(corr_cfg.get("enabled", False))
-    gps_trigger_distance_m = float(corr_cfg.get("gps_trigger_distance_m", 5.0))
-    min_pred_distance = float(corr_cfg.get("min_pred_distance", 1e-4))
-    max_frames_threshold = int(corr_cfg.get("max_frames_threshold", 50))
     confidence_threshold = float(filter_cfg.get("confidence_threshold", 0.5))
 
     print(f"[longstream] device={device}", flush=True)
     model = LongStreamModel(model_cfg).to(device)
     model.eval()
     print("[longstream] model ready", flush=True)
+
+    # --- TTO (Test-Time Optimization) 配置 ---
+    tto_enabled = bool(corr_cfg.get("tto_enabled", False))
+    tto_steps = int(corr_cfg.get("tto_steps", 20))
+    tto_lr = float(corr_cfg.get("tto_lr", 1e-3))
+    tto_weight_decay = float(corr_cfg.get("tto_weight_decay", 0.0))
+    tto_min_gps_disp = float(corr_cfg.get("tto_min_gps_disp", 1e-4))
+    tto_max_grad_norm = float(corr_cfg.get("tto_max_grad_norm", 1.0))
+    initial_scale_token = None
+    if tto_enabled:
+        if not hasattr(model.longstream, "scale_token"):
+            raise RuntimeError(
+                "[TTO] model.longstream 没有 scale_token 参数。"
+                "请在模型配置中设置 enable_scale_token: true。"
+            )
+        if not getattr(model.longstream, "enable_scale_token", False):
+            raise RuntimeError(
+                "[TTO] model.longstream.enable_scale_token 为 False。"
+                "请在模型配置中设置 enable_scale_token: true。"
+            )
+        for param in model.parameters():
+            param.requires_grad = False
+        model.longstream.scale_token.requires_grad = True
+        initial_scale_token = model.longstream.scale_token.detach().clone()
+        print("[longstream][TTO] 已启用：每条序列将在推理前优化 scale_token", flush=True)
 
     # 将帧质量过滤配置合并入 data_cfg传给 LongStreamDataLoader
     data_cfg_with_filter = dict(data_cfg)
@@ -480,6 +337,125 @@ def run_inference_cfg(cfg: dict):
 
             rel_pose_cfg = infer_cfg.get("rel_pose_head_cfg", {"num_iterations": 4})
 
+            # --- TTO: 使用 GPS 位移监督在最终推理前优化 scale_token ---
+            has_gps = getattr(seq, "gps_xyz", None) is not None
+            # 无论本序列是否有 GPS，只要 TTO 已启用就先重置 token，
+            # 避免有 GPS 序列的优化结果污染后续无 GPS 序列。
+            if tto_enabled:
+                model.longstream.scale_token.data.copy_(initial_scale_token)
+
+            outputs_tto = None  # 防止 tto_steps=0 或跳过时 del 报 NameError
+            if tto_enabled and has_gps:
+                tto_seq_optimizer = torch.optim.AdamW(
+                    [model.longstream.scale_token],
+                    lr=tto_lr,
+                    weight_decay=tto_weight_decay,
+                )
+                pair_stride = int(corr_cfg.get("tto_pair_stride", keyframe_stride))
+                pair_stride = max(1, min(pair_stride, S - 1))
+                gps_tensor = torch.as_tensor(
+                    seq.gps_xyz, device=device, dtype=torch.float32
+                )
+                min_len = min(S, gps_tensor.shape[0])
+                gps_tensor = gps_tensor[:min_len]
+                is_keyframe_d = is_keyframe.to(device)
+                keyframe_indices_d = keyframe_indices.to(device)
+                images_d = images.to(device)
+                rel_pose_num_iters = rel_pose_cfg.get("num_iterations", 4)
+                tto_skipped = False
+                print(
+                    f"[longstream][TTO] seq={seq.name} steps={tto_steps}"
+                    f" lr={tto_lr} pair_stride={pair_stride}",
+                    flush=True,
+                )
+                model.eval()
+                with torch.enable_grad():
+                    for step in range(tto_steps):
+                        tto_seq_optimizer.zero_grad(set_to_none=True)
+                        outputs_tto = _run_tto_pose_forward(
+                            model,
+                            images_d,
+                            is_keyframe_d,
+                            keyframe_indices_d,
+                            streaming_mode,
+                            rel_pose_num_iters,
+                        )
+                        if "rel_pose_enc" in outputs_tto:
+                            rel_enc = outputs_tto["rel_pose_enc"][0]
+                            abs_pose_enc = compose_abs_from_rel(
+                                rel_enc, keyframe_indices_d[0]
+                            )
+                            extri_tto, _ = pose_encoding_to_extri_intri(
+                                abs_pose_enc[None],
+                                image_size_hw=(H, W),
+                                build_intrinsics=False,
+                            )
+                        elif "pose_enc" in outputs_tto:
+                            extri_tto, _ = pose_encoding_to_extri_intri(
+                                outputs_tto["pose_enc"][0][None],
+                                image_size_hw=(H, W),
+                                build_intrinsics=False,
+                            )
+                        else:
+                            print(
+                                "[longstream][TTO] 无位姿输出，跳过 TTO",
+                                flush=True,
+                            )
+                            tto_skipped = True
+                            break
+                        # extri_tto: [1, S_tto, 3, 4] — 可微分
+                        R_tto = extri_tto[0, :min_len, :3, :3]  # [min_len, 3, 3]
+                        t_tto = extri_tto[0, :min_len, :3, 3]   # [min_len, 3]
+                        # 可微分相机中心: -R^T @ t
+                        pred_centers = -torch.einsum("sji,sj->si", R_tto, t_tto)
+                        pred_disp = torch.linalg.norm(
+                            pred_centers[pair_stride:] - pred_centers[:-pair_stride],
+                            dim=-1,
+                        )
+                        target_disp = torch.linalg.norm(
+                            gps_tensor[pair_stride:] - gps_tensor[:-pair_stride],
+                            dim=-1,
+                        )
+                        valid = (
+                            torch.isfinite(target_disp)
+                            & torch.isfinite(pred_disp)
+                            & (target_disp > tto_min_gps_disp)
+                        )
+                        if not valid.any():
+                            if step == 0:
+                                print(
+                                    f"[longstream][TTO] seq={seq.name}"
+                                    " 无有效 GPS 配对，跳过 TTO",
+                                    flush=True,
+                                )
+                                tto_skipped = True
+                            break
+                        loss = torch.nn.functional.huber_loss(
+                            pred_disp[valid], target_disp[valid]
+                        )
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            [model.longstream.scale_token], tto_max_grad_norm
+                        )
+                        tto_seq_optimizer.step()
+                        if step == 0 or (step + 1) % 5 == 0:
+                            print(
+                                f"[longstream][TTO] seq={seq.name}"
+                                f" step={step + 1}/{tto_steps}"
+                                f" loss={loss.item():.6f}",
+                                flush=True,
+                            )
+                if outputs_tto is not None:
+                    del outputs_tto
+                    outputs_tto = None
+                if not tto_skipped:
+                    print(
+                        f"[longstream][TTO] seq={seq.name} 完成,"
+                        f" scale_token norm="
+                        f"{model.longstream.scale_token.data.norm().item():.4f}",
+                        flush=True,
+                    )
+
             if mode == "batch_refresh":
                 outputs = run_batch_refresh(
                     model,
@@ -537,35 +513,6 @@ def run_inference_cfg(cfg: dict):
                     )
 
             # ============================================================
-            # GPS 松耦合尺度校正：仅修正尺度，保留纯视觉旋转
-            # scale_corrections 同时用于深度和点云
-            # ============================================================
-            scale_corrections = np.ones(S, dtype=np.float32)
-            if correction_enabled and extri_np is not None and getattr(seq, 'gps_xyz', None) is not None:
-                scale_corrections, extri_np = _compute_gps_loose_scale_corrections(
-                    extri_np=extri_np,
-                    gps_xyz=seq.gps_xyz,
-                    trigger_distance_m=gps_trigger_distance_m,
-                    min_pred_distance=min_pred_distance,
-                    max_frames_threshold=max_frames_threshold,
-                    sequence_name=seq.name,
-                    image_paths=seq.image_paths,
-                )
-                triggered = int(np.sum(scale_corrections != 1.0))
-                print(
-                    f"[longstream][gps_correction] seq={seq.name}"
-                    f" triggered_frames={triggered}/{S}"
-                    f" scale_range=[{scale_corrections.min():.4f}, {scale_corrections.max():.4f}]",
-                    flush=True,
-                )
-                # 保存尺度重锚后的位姿
-                pose_dir = os.path.join(seq_dir, "poses")
-                _ensure_dir(pose_dir)
-                save_w2c_txt(
-                    os.path.join(pose_dir, "abs_pose_corrected.txt"), extri_np, frame_ids
-                )
-
-            # ============================================================
             # 保存 frame_index_map.json（筛帧映射）
             # ============================================================
             save_fmap = bool(filter_cfg.get("save_frame_index_map", True))
@@ -606,9 +553,6 @@ def run_inference_cfg(cfg: dict):
             if save_depth and outputs.get("depth") is not None:
                 print(f"[longstream] sequence {seq.name}: saving depth", flush=True)
                 depth = outputs["depth"][0, :, :, :, 0].detach().cpu().numpy()
-                # 应用尺度补偿系数（来自 GT 位姿校正）
-                if correction_enabled and np.any(scale_corrections != 1.0):
-                    depth = _apply_depth_corrections(depth, scale_corrections)
                 depth_dir = os.path.join(seq_dir, "depth", "dpt")
                 _ensure_dir(depth_dir)
                 color_dir = os.path.join(seq_dir, "depth", "dpt_plasma")
@@ -649,7 +593,7 @@ def run_inference_cfg(cfg: dict):
                     )
 
             # ============================================================
-            # 点云导出：统一使用校正后的 extri_np/intri_np
+            # 点云导出：使用 TTO 后模型输出的 extri_np/intri_np
             # ============================================================
             if save_points:
                 print(
@@ -675,9 +619,6 @@ def run_inference_cfg(cfg: dict):
                     full_cols = []
                     for i in range(S):
                         pts_cam = pts[i]
-                        # 尺度校正（与 dpt_unproj 保持一致）
-                        if correction_enabled and scale_corrections[i] != 1.0:
-                            pts_cam = pts_cam * float(scale_corrections[i])
                         pts_world = _camera_points_to_world(pts_cam, extri_np[i])
                         pts_world = pts_world.reshape(pts[i].shape)
                         sky_m = sky_masks[i] if (sky_masks is not None and sky_masks[i] is not None) else None
@@ -716,11 +657,6 @@ def run_inference_cfg(cfg: dict):
                     and intri_np is not None
                 ):
                     depth_for_pts = outputs["depth"][0, :, :, :, 0]
-                    # 对深度做尺度校正（与保存的深度一致）
-                    if correction_enabled and np.any(scale_corrections != 1.0):
-                        depth_for_pts = depth_for_pts.clone()
-                        for i in range(S):
-                            depth_for_pts[i] = depth_for_pts[i] * float(scale_corrections[i])
 
                     dpt_pts_dir = os.path.join(seq_dir, "points", "dpt_unproj")
                     _ensure_dir(dpt_pts_dir)

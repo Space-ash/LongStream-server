@@ -71,13 +71,9 @@ def _load_gt_pose_data(seq_info):
 
 
 def _resolve_pred_pose_path(seq_dir, cfg):
-    """优先选择 abs_pose_corrected.txt，无校正时退回 abs_pose.txt。"""
-    corr_cfg = cfg.get("optimizations", {}).get("correction", {})
-    use_corrected = bool(corr_cfg.get("use_corrected_pose_for_eval", True))
-    if use_corrected:
-        corrected = os.path.join(seq_dir, "poses", "abs_pose_corrected.txt")
-        if os.path.isfile(corrected):
-            return corrected
+    """返回推理输出的位姿文件路径（abs_pose.txt）。
+    TTO 已在推理时将尺度优化嵌入模型，输出位姿无需后处理校正文件。
+    """
     return os.path.join(seq_dir, "poses", "abs_pose.txt")
 
 
