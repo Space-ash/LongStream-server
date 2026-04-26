@@ -114,7 +114,8 @@ optimizations:
     tto_steps: 20
     tto_lr: 1.0e-3
     tto_weight_decay: 0.0
-    tto_min_gps_disp: 1.0e-4
+    tto_window_size: 40
+    tto_min_gps_disp: 1.0
     tto_max_grad_norm: 1.0
     tto_pair_stride: 8
 

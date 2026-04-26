@@ -86,12 +86,16 @@ def add_runtime_arguments(parser):
         help="TTO 学习率，对应 optimizations.correction.tto_lr"
     )
     parser.add_argument(
+        "--tto-window-size", type=int, default=None,
+        help="TTO 滑动窗口帧数，对应 optimizations.correction.tto_window_size"
+    )
+    parser.add_argument(
         "--tto-pair-stride", type=int, default=None,
         help="TTO GPS 配对步长，对应 optimizations.correction.tto_pair_stride"
     )
     parser.add_argument(
         "--tto-min-gps-disp", type=float, default=None,
-        help="TTO 有效 GPS 位移最小値，对应 optimizations.correction.tto_min_gps_disp"
+        help="TTO 有效 GPS 位移最小值（米），对应 optimizations.correction.tto_min_gps_disp"
     )
     parser.add_argument(
         "--tto-max-grad-norm", type=float, default=None,
@@ -262,6 +266,8 @@ def load_config_with_overrides(args):
         opt.setdefault("correction", {})["tto_steps"] = args.tto_steps
     if args.tto_lr is not None:
         opt.setdefault("correction", {})["tto_lr"] = args.tto_lr
+    if args.tto_window_size is not None:
+        opt.setdefault("correction", {})["tto_window_size"] = args.tto_window_size
     if args.tto_pair_stride is not None:
         opt.setdefault("correction", {})["tto_pair_stride"] = args.tto_pair_stride
     if args.tto_min_gps_disp is not None:

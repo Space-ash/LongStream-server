@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import yaml
 import cv2
 import numpy as np
@@ -255,7 +256,8 @@ def run_inference_cfg(cfg: dict):
     tto_steps = int(corr_cfg.get("tto_steps", 20))
     tto_lr = float(corr_cfg.get("tto_lr", 1e-3))
     tto_weight_decay = float(corr_cfg.get("tto_weight_decay", 0.0))
-    tto_min_gps_disp = float(corr_cfg.get("tto_min_gps_disp", 1e-4))
+    tto_window_size = int(corr_cfg.get("tto_window_size", 40))
+    tto_min_gps_disp = float(corr_cfg.get("tto_min_gps_disp", 1.0))
     tto_max_grad_norm = float(corr_cfg.get("tto_max_grad_norm", 1.0))
     initial_scale_token = None
     if tto_enabled:
@@ -352,109 +354,166 @@ def run_inference_cfg(cfg: dict):
                     weight_decay=tto_weight_decay,
                 )
                 pair_stride = int(corr_cfg.get("tto_pair_stride", keyframe_stride))
-                pair_stride = max(1, min(pair_stride, S - 1))
                 gps_tensor = torch.as_tensor(
                     seq.gps_xyz, device=device, dtype=torch.float32
                 )
                 min_len = min(S, gps_tensor.shape[0])
                 gps_tensor = gps_tensor[:min_len]
-                is_keyframe_d = is_keyframe.to(device)
-                keyframe_indices_d = keyframe_indices.to(device)
-                images_d = images.to(device)
-                rel_pose_num_iters = rel_pose_cfg.get("num_iterations", 4)
+
+                # 计算窗口长度，防止单次前向处理全序列触发 OOM
+                window_len = min(tto_window_size, min_len)
                 tto_skipped = False
-                print(
-                    f"[longstream][TTO] seq={seq.name} steps={tto_steps}"
-                    f" lr={tto_lr} pair_stride={pair_stride}",
-                    flush=True,
-                )
-                model.eval()
-                with torch.enable_grad():
-                    for step in range(tto_steps):
-                        tto_seq_optimizer.zero_grad(set_to_none=True)
-                        outputs_tto = _run_tto_pose_forward(
-                            model,
-                            images_d,
-                            is_keyframe_d,
-                            keyframe_indices_d,
-                            streaming_mode,
-                            rel_pose_num_iters,
+
+                if window_len < 2:
+                    print(
+                        f"[longstream][TTO] seq={seq.name}"
+                        f" window_len={window_len} < 2，跳过 TTO",
+                        flush=True,
+                    )
+                    tto_skipped = True
+
+                if not tto_skipped:
+                    # 构建有效窗口池：50% overlap 滑动，头尾 GPS 列向位移 > tto_min_gps_disp
+                    window_step = max(1, window_len // 2)
+                    valid_start_indices = []
+                    for start_idx in range(0, min_len - window_len + 1, window_step):
+                        disp = torch.linalg.norm(
+                            gps_tensor[start_idx + window_len - 1] - gps_tensor[start_idx]
+                        ).item()
+                        if disp > tto_min_gps_disp:
+                            valid_start_indices.append(start_idx)
+
+                    if not valid_start_indices:
+                        print(
+                            f"[longstream][TTO] seq={seq.name}"
+                            f" no valid GPS windows (min_gps_disp={tto_min_gps_disp})，跳过 TTO",
+                            flush=True,
                         )
-                        if "rel_pose_enc" in outputs_tto:
-                            rel_enc = outputs_tto["rel_pose_enc"][0]
-                            abs_pose_enc = compose_abs_from_rel(
-                                rel_enc, keyframe_indices_d[0]
+                        tto_skipped = True
+
+                if not tto_skipped:
+                    rel_pose_num_iters = rel_pose_cfg.get("num_iterations", 4)
+                    # pair_stride 必须在窗口内有效
+                    pair_stride = max(1, min(pair_stride, window_len - 1))
+                    print(
+                        f"[longstream][TTO] seq={seq.name} steps={tto_steps}"
+                        f" lr={tto_lr} window_len={window_len}"
+                        f" pair_stride={pair_stride}"
+                        f" valid_windows={len(valid_start_indices)}",
+                        flush=True,
+                    )
+                    model.eval()
+                    with torch.enable_grad():
+                        for step in range(tto_steps):
+                            tto_seq_optimizer.zero_grad(set_to_none=True)
+
+                            # 随机采样一个有效窗口（mini-batch SGD 风格）
+                            start_idx = random.choice(valid_start_indices)
+                            end_idx = start_idx + window_len
+                            images_tto = images[:, start_idx:end_idx].to(device)
+                            gps_tto = gps_tensor[start_idx:end_idx]
+
+                            # 为局部窗口重新生成 keyframe 索引（内部索引 0 ~ window_len-1）
+                            is_keyframe_tto, keyframe_indices_tto = (
+                                selector.select_keyframes(
+                                    window_len, B, images_tto.device
+                                )
                             )
-                            extri_tto, _ = pose_encoding_to_extri_intri(
-                                abs_pose_enc[None],
-                                image_size_hw=(H, W),
-                                build_intrinsics=False,
+
+                            outputs_tto = _run_tto_pose_forward(
+                                model,
+                                images_tto,
+                                is_keyframe_tto,
+                                keyframe_indices_tto,
+                                streaming_mode,
+                                rel_pose_num_iters,
                             )
-                        elif "pose_enc" in outputs_tto:
-                            extri_tto, _ = pose_encoding_to_extri_intri(
-                                outputs_tto["pose_enc"][0][None],
-                                image_size_hw=(H, W),
-                                build_intrinsics=False,
-                            )
-                        else:
-                            print(
-                                "[longstream][TTO] 无位姿输出，跳过 TTO",
-                                flush=True,
-                            )
-                            tto_skipped = True
-                            break
-                        # extri_tto: [1, S_tto, 3, 4] — 可微分
-                        R_tto = extri_tto[0, :min_len, :3, :3]  # [min_len, 3, 3]
-                        t_tto = extri_tto[0, :min_len, :3, 3]   # [min_len, 3]
-                        # 可微分相机中心: -R^T @ t
-                        pred_centers = -torch.einsum("sji,sj->si", R_tto, t_tto)
-                        pred_disp = torch.linalg.norm(
-                            pred_centers[pair_stride:] - pred_centers[:-pair_stride],
-                            dim=-1,
-                        )
-                        target_disp = torch.linalg.norm(
-                            gps_tensor[pair_stride:] - gps_tensor[:-pair_stride],
-                            dim=-1,
-                        )
-                        valid = (
-                            torch.isfinite(target_disp)
-                            & torch.isfinite(pred_disp)
-                            & (target_disp > tto_min_gps_disp)
-                        )
-                        if not valid.any():
-                            if step == 0:
+
+                            if "rel_pose_enc" in outputs_tto:
+                                rel_enc = outputs_tto["rel_pose_enc"][0]
+                                abs_pose_enc = compose_abs_from_rel(
+                                    rel_enc, keyframe_indices_tto[0]
+                                )
+                                extri_tto, _ = pose_encoding_to_extri_intri(
+                                    abs_pose_enc[None],
+                                    image_size_hw=(H, W),
+                                    build_intrinsics=False,
+                                )
+                            elif "pose_enc" in outputs_tto:
+                                extri_tto, _ = pose_encoding_to_extri_intri(
+                                    outputs_tto["pose_enc"][0][None],
+                                    image_size_hw=(H, W),
+                                    build_intrinsics=False,
+                                )
+                            else:
                                 print(
-                                    f"[longstream][TTO] seq={seq.name}"
-                                    " 无有效 GPS 配对，跳过 TTO",
+                                    "[longstream][TTO] 无位姿输出，跳过 TTO",
                                     flush=True,
                                 )
                                 tto_skipped = True
-                            break
-                        loss = torch.nn.functional.huber_loss(
-                            pred_disp[valid], target_disp[valid]
-                        )
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            [model.longstream.scale_token], tto_max_grad_norm
-                        )
-                        tto_seq_optimizer.step()
-                        if step == 0 or (step + 1) % 5 == 0:
-                            print(
-                                f"[longstream][TTO] seq={seq.name}"
-                                f" step={step + 1}/{tto_steps}"
-                                f" loss={loss.item():.6f}",
-                                flush=True,
+                                break
+
+                            # extri_tto: [1, window_len, 3, 4] — 可微分
+                            R_tto = extri_tto[0, :, :3, :3]
+                            t_tto = extri_tto[0, :, :3, 3]
+                            pred_centers = -torch.einsum("sji,sj->si", R_tto, t_tto)
+
+                            pred_disp = torch.linalg.norm(
+                                pred_centers[pair_stride:] - pred_centers[:-pair_stride],
+                                dim=-1,
                             )
+                            target_disp = torch.linalg.norm(
+                                gps_tto[pair_stride:] - gps_tto[:-pair_stride],
+                                dim=-1,
+                            )
+                            valid = (
+                                torch.isfinite(target_disp)
+                                & torch.isfinite(pred_disp)
+                                & (target_disp > tto_min_gps_disp)
+                            )
+                            if not valid.any():
+                                if step == 0:
+                                    print(
+                                        f"[longstream][TTO] seq={seq.name}"
+                                        " step=0 无有效 GPS 配对，跳过 TTO",
+                                        flush=True,
+                                    )
+                                    tto_skipped = True
+                                break
+
+                            loss = torch.nn.functional.huber_loss(
+                                pred_disp[valid], target_disp[valid]
+                            )
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(
+                                [model.longstream.scale_token], tto_max_grad_norm
+                            )
+                            tto_seq_optimizer.step()
+
+                            if step == 0 or (step + 1) % 5 == 0:
+                                print(
+                                    f"[longstream][TTO] seq={seq.name}"
+                                    f" step={step + 1}/{tto_steps}"
+                                    f" win=[{start_idx},{end_idx})"
+                                    f" loss={loss.item():.6f}",
+                                    flush=True,
+                                )
+
+                            # 显式释放局部引用，避免图引用滤留
+                            del outputs_tto, images_tto
+                            outputs_tto = None
+
+                    if not tto_skipped:
+                        print(
+                            f"[longstream][TTO] seq={seq.name} 完成,"
+                            f" scale_token norm="
+                            f"{model.longstream.scale_token.data.norm().item():.4f}",
+                            flush=True,
+                        )
+
                 if outputs_tto is not None:
                     del outputs_tto
                     outputs_tto = None
-                if not tto_skipped:
-                    print(
-                        f"[longstream][TTO] seq={seq.name} 完成,"
-                        f" scale_token norm="
-                        f"{model.longstream.scale_token.data.norm().item():.4f}",
-                        flush=True,
-                    )
 
             if mode == "batch_refresh":
                 outputs = run_batch_refresh(
