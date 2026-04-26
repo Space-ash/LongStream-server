@@ -14,6 +14,7 @@ from longstream.streaming.refresh import run_batch_refresh, run_streaming_refres
 from longstream.utils.vendor.models.components.utils.pose_enc import (
     pose_encoding_to_extri_intri,
 )
+from longstream.utils.vendor.models.components.utils.rotation import quat_to_mat
 from longstream.utils.camera import compose_abs_from_rel
 from longstream.utils.depth import colorize_depth, unproject_depth_to_points
 from longstream.utils.sky_mask import compute_sky_mask
@@ -223,6 +224,56 @@ def _run_tto_pose_forward(
     return outputs
 
 
+def _compute_camera_centers_differentiable(
+    pose_enc: torch.Tensor,
+    keyframe_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    TTO 专用：从 pose_enc 全微分地计算相机中心。
+
+    Args:
+        pose_enc: [S, D]，前 3 小次元为平移 t，3:7 为单位四元数 q。
+            - keyframe_indices 为 None 时单元局是绕世界坐标的绝对 pose。
+            - keyframe_indices 不为 None 时单元局是相对 pose（rel_pose_enc）。
+        keyframe_indices: [S]，每帧对应的参考帧内部索引。
+
+    Returns:
+        pred_centers: [S, 3]，可微分相机中心（世界坐标）。
+    """
+    if pose_enc.ndim != 2:
+        raise ValueError(
+            f"pose_enc 应为 2D 张量 [S, D]，实际得到 {pose_enc.shape}"
+        )
+
+    rel_t = pose_enc[:, :3]       # [S, 3]
+    rel_q = pose_enc[:, 3:7]      # [S, 4]
+    rel_R = quat_to_mat(rel_q)    # [S, 3, 3]
+
+    if keyframe_indices is None:
+        # 绝对 pose 直接使用
+        abs_R = rel_R
+        abs_t = rel_t
+    else:
+        if keyframe_indices.ndim != 1:
+            raise ValueError(
+                f"keyframe_indices 应为 1D 张量 [S]，实际得到 {keyframe_indices.shape}"
+            )
+        S = pose_enc.shape[0]
+        R_list = [rel_R[0]]
+        t_list = [rel_t[0]]
+        for s in range(1, S):
+            ref_idx = int(keyframe_indices[s].item())
+            R_s = rel_R[s] @ R_list[ref_idx]
+            t_s = rel_t[s] + rel_R[s] @ t_list[ref_idx]
+            R_list.append(R_s)
+            t_list.append(t_s)
+        abs_R = torch.stack(R_list, dim=0)  # [S, 3, 3]
+        abs_t = torch.stack(t_list, dim=0)  # [S, 3]
+
+    # 相机中心 = -R^T @ t
+    return -torch.einsum("sji,sj->si", abs_R, abs_t)
+
+
 def run_inference_cfg(cfg: dict):
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     device_type = torch.device(device).type
@@ -430,20 +481,14 @@ def run_inference_cfg(cfg: dict):
                             )
 
                             if "rel_pose_enc" in outputs_tto:
-                                rel_enc = outputs_tto["rel_pose_enc"][0]
-                                abs_pose_enc = compose_abs_from_rel(
-                                    rel_enc, keyframe_indices_tto[0]
-                                )
-                                extri_tto, _ = pose_encoding_to_extri_intri(
-                                    abs_pose_enc[None],
-                                    image_size_hw=(H, W),
-                                    build_intrinsics=False,
+                                pred_centers = _compute_camera_centers_differentiable(
+                                    outputs_tto["rel_pose_enc"][0],
+                                    keyframe_indices_tto[0],
                                 )
                             elif "pose_enc" in outputs_tto:
-                                extri_tto, _ = pose_encoding_to_extri_intri(
-                                    outputs_tto["pose_enc"][0][None],
-                                    image_size_hw=(H, W),
-                                    build_intrinsics=False,
+                                pred_centers = _compute_camera_centers_differentiable(
+                                    outputs_tto["pose_enc"][0],
+                                    keyframe_indices=None,
                                 )
                             else:
                                 print(
@@ -452,11 +497,6 @@ def run_inference_cfg(cfg: dict):
                                 )
                                 tto_skipped = True
                                 break
-
-                            # extri_tto: [1, window_len, 3, 4] — 可微分
-                            R_tto = extri_tto[0, :, :3, :3]
-                            t_tto = extri_tto[0, :, :3, 3]
-                            pred_centers = -torch.einsum("sji,sj->si", R_tto, t_tto)
 
                             pred_disp = torch.linalg.norm(
                                 pred_centers[pair_stride:] - pred_centers[:-pair_stride],
