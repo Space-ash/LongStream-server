@@ -80,9 +80,23 @@ def run_batch_refresh(
     keyframe_stride: int,
     refresh: int,
     rel_pose_cfg,
+    loop_closure_cfg: dict = None,
+    local_ba_cfg: dict = None,
+    gps_xyz=None,
 ):
     B, S = images.shape[:2]
     device = _model_device(model)
+
+    lc_active = (loop_closure_cfg or {}).get("enabled", False)
+    ba_active = (local_ba_cfg or {}).get("enabled", False)
+    if lc_active or ba_active:
+        import warnings
+        warnings.warn(
+            "[refresh] loop_closure / local_ba are only supported in "
+            "streaming_refresh mode. Ignoring for batch_refresh.",
+            stacklevel=2,
+        )
+
     refresh_intervals = _refresh_intervals(refresh)
     frames_per_batch = refresh_intervals * keyframe_stride + 1
     step_frames = refresh_intervals * keyframe_stride
@@ -162,11 +176,27 @@ def run_streaming_refresh(
     window_size: int,
     refresh: int,
     rel_pose_cfg,
+    loop_closure_cfg: dict = None,
+    local_ba_cfg: dict = None,
+    gps_xyz=None,
 ):
     B, S = images.shape[:2]
     device = _model_device(model)
     refresh_intervals = _refresh_intervals(refresh)
-    session = StreamSession(model, mode=mode, window_size=window_size)
+    session = StreamSession(
+        model,
+        mode=mode,
+        window_size=window_size,
+        loop_closure_cfg=loop_closure_cfg,
+        local_ba_cfg=local_ba_cfg,
+        gps_xyz=gps_xyz,
+    )
+    # Pass GPS to loop manager (set again now that session is constructed)
+    if gps_xyz is not None and session.loop_manager is not None:
+        import numpy as np
+        gps_arr = np.asarray(gps_xyz, dtype=np.float32) if not hasattr(gps_xyz, "numpy") else gps_xyz.numpy().astype(np.float32)
+        session.loop_manager.set_gps_xyz(gps_arr)
+
     keyframe_count = 0
     segment_start = 0
     for s in range(S):
@@ -182,11 +212,16 @@ def run_streaming_refresh(
             keyframe_indices_s = keyframe_indices_s.to(device, non_blocking=True)
         else:
             keyframe_indices_s = None
+
+        # Global keyframe index for this frame (before segment adjustment)
+        global_kf_idx_s = int(keyframe_indices[0, s].item()) if keyframe_indices is not None else s
+
         session.forward_stream(
             frame_images,
             is_keyframe=is_keyframe_s,
             keyframe_indices=keyframe_indices_s,
             record=True,
+            global_kf_idx=global_kf_idx_s,
         )
         if is_keyframe_s is None or not bool(is_keyframe_s.item()) or s <= 0:
             del frame_images
@@ -208,10 +243,29 @@ def run_streaming_refresh(
                 is_keyframe=is_keyframe_s,
                 keyframe_indices=keyframe_indices_self,
                 record=False,
+                global_kf_idx=global_kf_idx_s,
             )
         del frame_images
         if is_keyframe_s is not None:
             del is_keyframe_s
         if keyframe_indices_s is not None:
             del keyframe_indices_s
-    return session.get_all_predictions()
+
+    # Merge sequence predictions
+    outputs = session.get_all_predictions()
+
+    # Shut down async workers first so all pending BA/PGO jobs finish before
+    # we collect their results.  get_loop_closure_outputs() is non-blocking
+    # and reads the shared result buffers, so it must come AFTER shutdown().
+    session.shutdown()
+
+    # Merge loop closure / PGO / BA results
+    lc_outputs = session.get_loop_closure_outputs()
+    if lc_outputs.get("optimized_w2c") is not None:
+        outputs["optimized_w2c"] = lc_outputs["optimized_w2c"]
+    if lc_outputs.get("loop_edges"):
+        outputs["loop_edges"] = lc_outputs["loop_edges"]
+    if lc_outputs.get("local_ba_windows"):
+        outputs["local_ba_windows"] = lc_outputs["local_ba_windows"]
+
+    return outputs

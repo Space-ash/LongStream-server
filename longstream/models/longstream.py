@@ -182,6 +182,7 @@ class LongStream(nn.Module, PyTorchModelHubMixin):
         camera_head_kv_cache_list: Optional[List[List[List[torch.Tensor]]]] = None,
         rel_pose_inputs: Optional[Dict] = None,
         is_keyframe: Optional[torch.Tensor] = None,
+        return_feature_cache: bool = False,
     ):
         skip_dense_heads = os.getenv("SKIP_DENSE_HEADS", "0") == "1"
 
@@ -384,6 +385,14 @@ class LongStream(nn.Module, PyTorchModelHubMixin):
 
         if camera_head_kv_cache_list is not None:
             predictions["camera_head_kv_cache_list"] = camera_head_kv_cache_list
+
+        # Feature cache output for loop closure / local BA (detached, not in grad graph)
+        # These keys are intentionally NOT in _update_predictions sequence_keys;
+        # they must be consumed immediately in StreamSession and released.
+        if return_feature_cache and len(aggregated_tokens_list) > 0:
+            feature_tokens = aggregated_tokens_list[-1].detach()  # [B, S, P_total, 2*embed_dim]
+            predictions["feature_tokens"] = feature_tokens
+            predictions["patch_start_idx_cache"] = patch_start_idx  # Python int
 
         if not self.training:
             predictions["images"] = images

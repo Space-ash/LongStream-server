@@ -82,6 +82,31 @@ def collect_points(
         source = point_head
         depth = None
         intri = None
+    elif branch == "local_ba_fused":
+        # Local BA fused points are stored as flat world-coordinate arrays
+        ba_pts_path = session_file(session_dir, "local_ba_points.npy")
+        ba_cols_path = session_file(session_dir, "local_ba_colors.npy")
+        if not os.path.exists(ba_pts_path):
+            # Fall back to depth branch if no BA points saved
+            branch = "depth"
+            source = None
+            depth = np.load(session_file(session_dir, "depth.npy"), mmap_mode="r")
+            intri = np.load(session_file(session_dir, "intri.npy"), mmap_mode="r")
+        else:
+            ba_pts_world = np.load(ba_pts_path, mmap_mode="r")   # [N, 3] world coords
+            ba_cols = np.load(ba_cols_path, mmap_mode="r") if os.path.exists(ba_cols_path) else None
+            # Apply world_to_view and origin_shift (same convention as other branches)
+            pts_view = world_to_view(ba_pts_world) - origin_shift[None]
+            rng = np.random.default_rng(seed)
+            budget = max_points
+            if budget is not None and len(pts_view) > budget:
+                idx = rng.choice(len(pts_view), size=budget, replace=False)
+                pts_view = pts_view[idx]
+                if ba_cols is not None:
+                    ba_cols = ba_cols[idx]
+            pts_view = pts_view.astype(np.float32, copy=False)
+            colors_out = ba_cols.astype(np.uint8, copy=False) if ba_cols is not None else np.full((len(pts_view), 3), 128, dtype=np.uint8)
+            return pts_view, colors_out, origin_shift
     else:
         source = None
         depth = np.load(session_file(session_dir, "depth.npy"), mmap_mode="r")

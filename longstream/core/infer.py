@@ -286,6 +286,8 @@ def run_inference_cfg(cfg: dict):
     opt_cfg = cfg.get("optimizations", {})
     filter_cfg = opt_cfg.get("filter", {})
     corr_cfg = opt_cfg.get("correction", {})
+    loop_cfg = opt_cfg.get("loop_closure", {})
+    local_ba_cfg = opt_cfg.get("local_ba", {})
     frame_filter_enabled = bool(
         filter_cfg.get("frame_filter_enabled", filter_cfg.get("enabled", False))
     )
@@ -348,6 +350,16 @@ def run_inference_cfg(cfg: dict):
         mode = "streaming_refresh"
     streaming_mode = infer_cfg.get("streaming_mode", "causal")
     window_size = int(infer_cfg.get("window_size", 5))
+
+    # Validate: loop_closure and local_ba only operate in streaming_refresh mode.
+    # Fail early with a clear message so the user is never silently misled.
+    if loop_cfg.get("enabled", False) or local_ba_cfg.get("enabled", False):
+        if mode != "streaming_refresh":
+            raise ValueError(
+                "loop_closure/local_ba require inference.mode: streaming_refresh "
+                f"(current mode is '{mode}'). "
+                "Please set 'inference.mode: streaming_refresh' in your config."
+            )
 
     selector = KeyframeSelector(
         min_interval=keyframe_stride,
@@ -576,6 +588,9 @@ def run_inference_cfg(cfg: dict):
                     window_size,
                     refresh,
                     rel_pose_cfg,
+                    loop_closure_cfg=loop_cfg,
+                    local_ba_cfg=local_ba_cfg,
+                    gps_xyz=getattr(seq, "gps_xyz", None),
                 )
             else:
                 raise ValueError(f"Unsupported inference mode: {mode}")
@@ -598,6 +613,19 @@ def run_inference_cfg(cfg: dict):
             extri_np, intri_np, rel_pose_enc = _decode_predicted_extri_intri(
                 outputs, keyframe_indices, H, W
             )
+
+            # 如果 PGO 已完成，用优化后的轨迹覆盖
+            if "optimized_w2c" in outputs and outputs["optimized_w2c"] is not None:
+                opt_w2c = outputs["optimized_w2c"]  # [S_pgo, 4, 4]
+                if extri_np is not None and opt_w2c.shape[0] >= S:
+                    extri_np = opt_w2c[:S].astype(np.float32)
+                    print(
+                        f"[longstream] sequence {seq.name}: "
+                        "using PGO-optimised trajectory",
+                        flush=True,
+                    )
+                elif extri_np is None and opt_w2c.shape[0] >= S:
+                    extri_np = opt_w2c[:S].astype(np.float32)
 
             if extri_np is not None:
                 pose_dir = os.path.join(seq_dir, "poses")
@@ -814,6 +842,76 @@ def run_inference_cfg(cfg: dict):
                         max_points=max_full_pointcloud_points,
                         seed=1,
                     )
+
+                # --- Local BA 融合点云（若 BA 已产生结果）---
+                local_ba_windows = outputs.get("local_ba_windows")
+                if local_ba_windows and len(local_ba_windows) > 0:
+                    try:
+                        from longstream.streaming.loop_closure import Open3DFusion
+
+                        voxel_size = float(local_ba_cfg.get("voxel_size", 0.03))
+                        nb_neighbors = int(local_ba_cfg.get("nb_neighbors", 20))
+                        std_ratio = float(local_ba_cfg.get("std_ratio", 2.0))
+                        fuser = Open3DFusion(voxel_size, nb_neighbors, std_ratio)
+
+                        all_fused_pts: list = []
+                        all_fused_cols: list = []
+                        for win in local_ba_windows:
+                            win_frame_ids = win.get("frame_ids", [])
+                            win_w2c = win.get("opt_w2c", [])
+                            win_depths = win.get("opt_depths", [])
+                            from longstream.streaming.loop_closure import FrameEntry
+
+                            # Reconstruct lightweight FrameEntry-like objects
+                            dummy_entries = []
+                            for fi, (fw2c, fd) in zip(win_frame_ids, zip(win_w2c, win_depths)):
+                                if fi < S:
+                                    fe = FrameEntry(
+                                        frame_id=fi,
+                                        descriptor=None,
+                                        pose_token=None,
+                                        patch_tokens=None,
+                                        depth=fd if isinstance(fd, torch.Tensor) else torch.from_numpy(fd),
+                                        pose_enc=None,
+                                        global_kf_idx=fi,
+                                        intri=intri_np[fi] if intri_np is not None and fi < len(intri_np) else np.eye(3, dtype=np.float32),
+                                        image_hw=(H, W),
+                                        w2c_init=fw2c,
+                                        rgb=rgb[fi],
+                                    )
+                                    dummy_entries.append(fe)
+                            if not dummy_entries:
+                                continue
+                            pts_fused, cols_fused = fuser.fuse_window(
+                                dummy_entries,
+                                [fe.w2c_init for fe in dummy_entries],
+                                [fe.depth for fe in dummy_entries],
+                            )
+                            if len(pts_fused) > 0:
+                                all_fused_pts.append(pts_fused)
+                                if cols_fused is not None:
+                                    all_fused_cols.append(cols_fused)
+
+                        if all_fused_pts:
+                            replace_full = bool(local_ba_cfg.get("replace_full_pointcloud", False))
+                            fused_path = os.path.join(seq_dir, "points", "local_ba_fused.ply")
+                            _save_full_pointcloud(
+                                fused_path,
+                                all_fused_pts,
+                                all_fused_cols if len(all_fused_cols) == len(all_fused_pts) else [],
+                                max_points=max_full_pointcloud_points,
+                                seed=2,
+                            )
+                            print(
+                                f"[longstream] sequence {seq.name}: "
+                                f"saved local BA fused cloud → {fused_path}",
+                                flush=True,
+                            )
+                    except Exception as _ba_ex:
+                        print(
+                            f"[longstream] local BA point cloud export failed: {_ba_ex}",
+                            flush=True,
+                        )
             del outputs
             if device_type == "cuda":
                 torch.cuda.empty_cache()

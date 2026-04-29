@@ -257,7 +257,8 @@ def _select_keyframes(images: torch.Tensor, keyframe_stride: int, keyframe_mode:
     return selector.select_keyframes(images.shape[1], images.shape[0], images.device)
 
 
-def _run_model(images: torch.Tensor, model: LongStreamModel, infer_cfg: dict):
+def _run_model(images: torch.Tensor, model: LongStreamModel, infer_cfg: dict,
+               opt_cfg: dict = None):
     keyframe_stride = int(infer_cfg.get("keyframe_stride", 8))
     keyframe_mode = infer_cfg.get("keyframe_mode", "fixed")
     refresh = int(infer_cfg.get("refresh", 4))
@@ -265,6 +266,10 @@ def _run_model(images: torch.Tensor, model: LongStreamModel, infer_cfg: dict):
     streaming_mode = infer_cfg.get("streaming_mode", "causal")
     window_size = int(infer_cfg.get("window_size", 48))
     rel_pose_cfg = infer_cfg.get("rel_pose_head_cfg", {"num_iterations": 4})
+
+    _opt = opt_cfg or {}
+    loop_cfg = _opt.get("loop_closure", {})
+    local_ba_cfg = _opt.get("local_ba", {})
 
     is_keyframe, keyframe_indices = _select_keyframes(
         images, keyframe_stride, keyframe_mode
@@ -279,6 +284,8 @@ def _run_model(images: torch.Tensor, model: LongStreamModel, infer_cfg: dict):
             keyframe_stride,
             refresh,
             rel_pose_cfg,
+            loop_closure_cfg=loop_cfg,
+            local_ba_cfg=local_ba_cfg,
         )
     elif mode == "streaming_refresh":
         outputs = run_streaming_refresh(
@@ -290,6 +297,8 @@ def _run_model(images: torch.Tensor, model: LongStreamModel, infer_cfg: dict):
             window_size,
             refresh,
             rel_pose_cfg,
+            loop_closure_cfg=loop_cfg,
+            local_ba_cfg=local_ba_cfg,
         )
     else:
         raise ValueError(f"Unsupported demo inference mode: {mode}")
@@ -366,6 +375,7 @@ def create_demo_session(
     data_cfg = dict(base_cfg.get("data", {}))
     model_cfg = dict(base_cfg.get("model", {}))
     infer_cfg = dict(base_cfg.get("inference", {}))
+    opt_cfg = dict(base_cfg.get("optimizations", {}))
 
     if image_dir:
         image_dir = os.path.abspath(image_dir)
@@ -404,7 +414,7 @@ def create_demo_session(
     )
 
     with torch.no_grad():
-        outputs, keyframe_indices = _run_model(images, model, infer_cfg)
+        outputs, keyframe_indices = _run_model(images, model, infer_cfg, opt_cfg=opt_cfg)
         h, w = images.shape[-2:]
         rel_pose_enc, extri, intri = _compute_pose_outputs(
             outputs, keyframe_indices, (h, w)
@@ -442,7 +452,20 @@ def create_demo_session(
     np.save(session_file(session_dir, "images.npy"), images_uint8)
     np.save(session_file(session_dir, "depth.npy"), depth)
     np.save(session_file(session_dir, "point_head.npy"), point_head)
-    np.save(session_file(session_dir, "w2c.npy"), extri)
+
+    # Use PGO-optimised trajectory if available; always save raw w2c for comparison
+    np.save(session_file(session_dir, "w2c_raw.npy"), extri)
+    if "optimized_w2c" in outputs and outputs["optimized_w2c"] is not None:
+        opt_w2c = outputs["optimized_w2c"]
+        S_frames = extri.shape[0]
+        if opt_w2c.shape[0] >= S_frames:
+            extri_to_save = opt_w2c[:S_frames].astype(np.float32)
+        else:
+            extri_to_save = extri
+    else:
+        extri_to_save = extri
+    np.save(session_file(session_dir, "w2c.npy"), extri_to_save)
+
     np.save(session_file(session_dir, "intri.npy"), intri)
     if rel_pose_enc is not None:
         np.save(
@@ -454,6 +477,70 @@ def create_demo_session(
             session_file(session_dir, "sky_masks.npy"),
             sky_masks.astype(np.uint8, copy=False),
         )
+
+    # Save local BA fused point cloud if available
+    local_ba_windows = outputs.get("local_ba_windows")
+    if local_ba_windows and len(local_ba_windows) > 0:
+        try:
+            from longstream.streaming.loop_closure import Open3DFusion, FrameEntry
+            import torch as _torch
+
+            fusion = Open3DFusion(
+                voxel_size=float(opt_cfg.get("local_ba", {}).get("voxel_size", 0.03)),
+                nb_neighbors=int(opt_cfg.get("local_ba", {}).get("nb_neighbors", 20)),
+                std_ratio=float(opt_cfg.get("local_ba", {}).get("std_ratio", 2.0)),
+            )
+
+            all_pts = []
+            all_cols = []
+            S_intri = intri.shape[0]
+
+            for win in local_ba_windows:
+                frame_ids = win.get("frame_ids", [])
+                opt_w2c_list = win.get("opt_w2c", [])
+                opt_depths = win.get("opt_depths", [])
+
+                if len(frame_ids) < 2 or len(opt_w2c_list) < 2 or len(opt_depths) < 2:
+                    continue
+
+                # Build minimal FrameEntry objects (fuse_window only reads .intri and .rgb)
+                window_frames = []
+                for i, fid in enumerate(frame_ids):
+                    intri_i = intri[min(fid, S_intri - 1)].astype(np.float32)
+                    rgb_i = images_uint8[fid] if fid < len(images_uint8) else None
+                    fe = FrameEntry(
+                        frame_id=fid,
+                        descriptor=np.zeros(1, dtype=np.float32),
+                        pose_token=_torch.zeros(1),
+                        patch_tokens=_torch.zeros(1, 1),
+                        depth=opt_depths[i] if i < len(opt_depths) else _torch.zeros(1),
+                        pose_enc=_torch.zeros(9),
+                        global_kf_idx=fid,
+                        intri=intri_i,
+                        image_hw=(int(h), int(w)),
+                        p_total=1,
+                        w2c_init=None,
+                        rgb=rgb_i,
+                    )
+                    window_frames.append(fe)
+
+                pts, cols = fusion.fuse_window(window_frames, opt_w2c_list, opt_depths)
+                if pts.shape[0] > 0:
+                    all_pts.append(pts)
+                    if cols is not None:
+                        all_cols.append(cols)
+
+            if all_pts:
+                combined_pts = np.concatenate(all_pts, axis=0).astype(np.float32)
+                np.save(session_file(session_dir, "local_ba_points.npy"), combined_pts)
+                if len(all_cols) == len(all_pts):
+                    combined_cols = np.concatenate(all_cols, axis=0).astype(np.uint8)
+                    np.save(session_file(session_dir, "local_ba_colors.npy"), combined_cols)
+        except Exception as _ba_exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[backend] local BA fused point cloud failed: %s", _ba_exc
+            )
 
     sky_removed_ratio = None
     if sky_masks is not None:
@@ -476,6 +563,15 @@ def create_demo_session(
         "image_paths": image_paths,
         "has_sky_masks": bool(sky_masks is not None),
         "sky_removed_ratio": sky_removed_ratio,
+        "has_pgo_trajectory": bool(
+            "optimized_w2c" in outputs and outputs["optimized_w2c"] is not None
+        ),
+        "loop_closure_enabled": bool(
+            opt_cfg.get("loop_closure", {}).get("enabled", False)
+        ),
+        "local_ba_enabled": bool(
+            opt_cfg.get("local_ba", {}).get("enabled", False)
+        ),
     }
     with open(session_file(session_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)

@@ -8,6 +8,10 @@ class StreamSession:
         mode: str,
         window_size: int = 5,
         keep_first_frame_anchor: bool = True,
+        loop_closure_cfg: dict = None,
+        local_ba_cfg: dict = None,
+        gps_xyz=None,
+        async_loop_closure: bool = True,
     ):
         self.model = model
         self.core_model = getattr(model, "longstream", model)
@@ -34,6 +38,38 @@ class StreamSession:
         if self.use_rel_pose_head:
             self.rel_pose_head_trunk_depth = self.core_model.rel_pose_head.trunk_depth
             self.rel_pose_head_iterations = 4
+
+        # --- Loop closure / BA integration ---
+        lc_cfg = loop_closure_cfg or {}
+        ba_cfg = local_ba_cfg or {}
+        self.loop_enabled = bool(lc_cfg.get("enabled", False))
+        self.local_ba_enabled = bool(ba_cfg.get("enabled", False))
+        self._return_feature_cache = self.loop_enabled or self.local_ba_enabled
+
+        self.loop_manager = None
+        if self._return_feature_cache:
+            from longstream.streaming.loop_closure import LoopClosureManager
+
+            device_str = str(next(self.core_model.parameters()).device)
+            self.loop_manager = LoopClosureManager(
+                rel_pose_head=(
+                    self.core_model.rel_pose_head if self.use_rel_pose_head else None
+                ),
+                lc_cfg=lc_cfg,
+                ba_cfg=ba_cfg,
+                device=device_str,
+                patch_size=int(getattr(self.core_model, "patch_size", 14)),
+                embed_dim=int(getattr(self.core_model, "embed_dim", 1024)),
+            )
+            if gps_xyz is not None:
+                import numpy as np
+                self.loop_manager.set_gps_xyz(
+                    gps_xyz if isinstance(gps_xyz, type(None))
+                    else (gps_xyz if hasattr(gps_xyz, "shape") else None)
+                )
+
+        # Global frame counter for loop manager (incremented per record=True call)
+        self._global_frame_id = 0
 
         self.clear()
 
@@ -199,6 +235,9 @@ class StreamSession:
     def clear(self):
         self._clear_predictions()
         self._clear_cache()
+        self._global_frame_id = 0
+        if self.loop_manager is not None:
+            self.loop_manager.clear()
         if self.use_rel_pose_head:
             if hasattr(self.core_model.rel_pose_head, "_keyframe_tokens_cache"):
                 self.core_model.rel_pose_head._keyframe_tokens_cache = {}
@@ -217,8 +256,24 @@ class StreamSession:
             if hasattr(self.core_model.rel_pose_head, "_frame_info"):
                 self.core_model.rel_pose_head._frame_info = []
 
+    def get_loop_closure_outputs(self) -> dict:
+        """Return loop closure / PGO / BA results (non-blocking, may be partial)."""
+        if self.loop_manager is None:
+            return {}
+        return {
+            "optimized_w2c": self.loop_manager.get_optimized_w2c(),
+            "loop_edges": self.loop_manager.get_loop_edges(),
+            "local_ba_windows": self.loop_manager.get_local_ba_windows(),
+        }
+
+    def shutdown(self) -> None:
+        """Gracefully shut down async workers (call after sequence ends)."""
+        if self.loop_manager is not None:
+            self.loop_manager.shutdown()
+
     def forward_stream(
-        self, images, is_keyframe=None, keyframe_indices=None, record: bool = True
+        self, images, is_keyframe=None, keyframe_indices=None, record: bool = True,
+        global_kf_idx: int = 0,
     ):
         aggregator_kv_cache_list, camera_head_kv_cache_list = self._get_cache()
 
@@ -241,6 +296,7 @@ class StreamSession:
             camera_head_kv_cache_list=camera_head_kv_cache_list,
             rel_pose_inputs=rel_pose_inputs,
             is_keyframe=is_keyframe,
+            return_feature_cache=self._return_feature_cache,
         )
 
         if record:
@@ -290,5 +346,89 @@ class StreamSession:
                                 ] = rel_pose_kv_cache[i][j][k][
                                     :, :, start_idx:
                                 ].contiguous()
+
+        # ---------------------------------------------------------------
+        # Loop closure: feed per-frame features to manager (non-blocking)
+        # ---------------------------------------------------------------
+        if record and self._return_feature_cache and self.loop_manager is not None:
+            ft = outputs.get("feature_tokens")
+            psi = outputs.get("patch_start_idx_cache")
+            if ft is not None and psi is not None:
+                # Extract scalar pose_enc for current frame [D]
+                pe_key = "rel_pose_enc" if "rel_pose_enc" in outputs else "pose_enc"
+                pe_raw = outputs.get(pe_key)
+                if pe_raw is not None:
+                    pose_enc_s = pe_raw[0, -1].detach().cpu().float()  # [D]
+                else:
+                    pose_enc_s = torch.zeros(9)
+
+                # Depth for current frame [H, W]
+                depth_out = outputs.get("depth")
+                if depth_out is not None:
+                    depth_s = depth_out[0, -1, :, :, 0].detach().cpu().float()
+                else:
+                    depth_s = torch.zeros(depth_hw[0], depth_hw[1])
+
+                # Decode intrinsics from FoV fields of current frame's pose encoding.
+                # pose_enc "absT_quaR_FoV" layout: [T(3), quat(4), fov_h, fov_w]
+                import numpy as _np
+                import logging as _logging
+                _lc_logger = _logging.getLogger(__name__)
+                intri_np = None
+                if pose_enc_s.shape[0] >= 9:
+                    try:
+                        H_d, W_d = int(depth_hw[0]), int(depth_hw[1])
+                        fov_h = float(pose_enc_s[7].item())
+                        fov_w = float(pose_enc_s[8].item())
+                        if (
+                            _np.isfinite(fov_h) and abs(fov_h) > 1e-6
+                            and _np.isfinite(fov_w) and abs(fov_w) > 1e-6
+                        ):
+                            import math as _math
+                            fy = (H_d / 2.0) / _math.tan(fov_h / 2.0)
+                            fx = (W_d / 2.0) / _math.tan(fov_w / 2.0)
+                            intri_np = _np.array(
+                                [[fx, 0.0, W_d / 2.0],
+                                 [0.0, fy, H_d / 2.0],
+                                 [0.0, 0.0, 1.0]],
+                                dtype=_np.float32,
+                            )
+                        else:
+                            _lc_logger.warning(
+                                "[StreamSession] frame %d: invalid FoV in pose_enc "
+                                "(fov_h=%.4f fov_w=%.4f); BA/fusion skipped.",
+                                self._global_frame_id, fov_h, fov_w,
+                            )
+                    except Exception as _exc:
+                        _lc_logger.warning(
+                            "[StreamSession] frame %d: intri decode failed (%s); "
+                            "BA/fusion skipped.", self._global_frame_id, _exc,
+                        )
+                else:
+                    _lc_logger.warning(
+                        "[StreamSession] frame %d: pose_enc too short (len=%d), "
+                        "no FoV; BA/fusion skipped.",
+                        self._global_frame_id, pose_enc_s.shape[0],
+                    )
+
+                # Feature tokens: take last frame slice [1, 1, P_total, 2*embed_dim]
+                ft_s = ft[:, -1:, :, :].cpu()  # [1, 1, P_total, 2*embed_dim]
+
+                self.loop_manager.on_frame(
+                    frame_id=self._global_frame_id,
+                    feature_tokens=ft_s,
+                    patch_start_idx=int(psi),
+                    depth=depth_s,
+                    pose_enc=pose_enc_s,
+                    global_kf_idx=global_kf_idx,
+                    image_hw=tuple(depth_hw),
+                    intri=intri_np,
+                )
+                # Release large tensors immediately — must not persist in outputs
+                del ft_s, ft, psi
+                outputs.pop("feature_tokens", None)
+                outputs.pop("patch_start_idx_cache", None)
+
+            self._global_frame_id += 1
 
         return outputs

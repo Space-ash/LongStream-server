@@ -10,3 +10,6 @@ pandas==2.1.4
 gradio
 plotly
 trimesh
+faiss-cpu
+g2o-python
+open3d

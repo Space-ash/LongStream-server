@@ -81,6 +81,26 @@ optimizations:
     save_frame_index_map: true
   correction:
     tto_enabled: false
+  loop_closure:
+    enabled: false
+    faiss_dim: 128
+    min_frame_gap: 80
+    topk: 5
+    similarity_threshold: 0.72
+    pgo_enabled: true
+    use_gps_prior: true
+  local_ba:
+    enabled: false
+    window_radius: 4
+    steps: 30
+    lr_pose: 0.001
+    lr_depth: 0.0005
+    feature_dim: 128
+    max_cached_frames: 3000
+    max_pairs: 64
+    voxel_size: 0.03
+    nb_neighbors: 20
+    std_ratio: 2.0
 
 output:
   root: outputs/ablation
